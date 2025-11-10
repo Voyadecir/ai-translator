@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from ai_translator.utils.health import check_health
-from ai_translator.translate.client import translate_text  # your original import
+from ai_translator.translate.client import translate_text
 
 app = FastAPI(
     title="AI Translator API",
@@ -14,14 +14,12 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------
-# CORS – allow your website to call this API
+# CORS: allow your website to call this API
 # ---------------------------------------------------------
 origins = [
     "https://voyadecir.com",
     "https://www.voyadecir.com",
-    "https://voyadecir-site.onrender.com",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000"
+    "https://voyadecir-site.onrender.com"  # your static site on Render
 ]
 
 app.add_middleware(
@@ -40,7 +38,6 @@ def root():
     return {
         "message": "🎉 Welcome to the AI Translator API!",
         "status": "live",
-        "docs": "/docs",
         "endpoints": ["/translate", "/api/translate", "/translate-pdf", "/health"],
     }
 
@@ -59,7 +56,7 @@ def health_check():
     }
 
 # ---------------------------------------------------------
-# OLD: form version (keep)
+# OLD form-style translate (keep)
 # ---------------------------------------------------------
 @app.post("/translate")
 async def translate_form(
@@ -67,36 +64,24 @@ async def translate_form(
     target_lang: str = Form("es"),
 ):
     try:
-        result = translate_text(text, target_lang)
-        return {"original": text, "translated": result, "target_lang": target_lang}
+        translated = translate_text(text, target_lang)
+        return {"original": text, "translated": translated, "target_lang": target_lang}
     except Exception as e:
-        # return a friendly error
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e), "hint": "Form endpoint failed."},
-        )
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ---------------------------------------------------------
-# NEW: JSON version for your website
+# NEW JSON translate – this is what your website calls
 # ---------------------------------------------------------
 @app.post("/api/translate")
 async def translate_json(request: Request):
-    """
-    Expected JSON:
-    {
-      "text": "Hello world",
-      "target_lang": "es"
-    }
-    """
     data = await request.json()
-    text = data.get("text", "").strip()
+    text = (data.get("text") or "").strip()
     target_lang = data.get("target_lang", "es")
 
     if not text:
         return JSONResponse(status_code=400, content={"error": "No text provided."})
 
     try:
-        # try your real translator first
         translated = translate_text(text, target_lang)
         return {
             "original_text": text,
@@ -104,18 +89,17 @@ async def translate_json(request: Request):
             "target_lang": target_lang,
         }
     except Exception as e:
-        # if your real translator breaks, send back a dummy translation
-        # so the front-end still works
-        fallback = f"[fallback {target_lang}] {text}"
-        return {
-            "original_text": text,
-            "translated_text": fallback,
-            "target_lang": target_lang,
-            "warning": f"Translator raised: {str(e)}"
-        }
+        # if translation blows up, at least return something
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "hint": "Translator raised an error on the server."
+            },
+        )
 
 # ---------------------------------------------------------
-# PDF upload (as you had it)
+# PDF upload (kept)
 # ---------------------------------------------------------
 @app.post("/translate-pdf")
 async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
@@ -133,7 +117,7 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
     }
 
 # ---------------------------------------------------------
-# Run locally
+# Local run
 # ---------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
