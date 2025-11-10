@@ -2,71 +2,107 @@ from __future__ import annotations
 import os
 import json
 from dataclasses import dataclass
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
+from typing import Union
 import urllib.request
+import urllib.error
 
 
+# --------------------------------------------------------
+# Config object (kept so old code doesn't break)
+# --------------------------------------------------------
 @dataclass
 class TranslationConfig:
     target_lang: str
     timeout: int = 30
 
 
-class TransientHTTPError(Exception):
-    """Temporary network failure that should trigger retry logic."""
+# --------------------------------------------------------
+# Helper: call OpenAI's API using urllib (no extra deps)
+# --------------------------------------------------------
+def _openai_translate(text: str, target_lang: str, timeout: int = 30) -> str:
+    """
+    Call OpenAI API to translate text into target_lang.
+    We keep it simple: system prompt + user text.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        # no key? return fallback
+        return f"[{target_lang}] {text}"
 
-    pass
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
 
+    # You can change the model if you have a better one on your account
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a translation assistant. "
+                    "Translate the user's text into the exact target language. "
+                    "Return ONLY the translated text, no explanations."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Translate this into {target_lang}:\n{text}",
+            },
+        ],
+        "temperature": 0.2,
+    }
 
-def _http_post_json(url: str, payload: dict, timeout: int) -> dict:
-    """Send JSON payload via HTTP POST, with timeout and retry."""
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
-    )
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            parsed = json.loads(raw)
+            return parsed["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        # If OpenAI says no (bad key, no credit, etc), fall back
+        return f"[{target_lang}] {text} (openai error: {e.code})"
     except Exception as e:
-        raise TransientHTTPError(str(e))
+        # any other network error: fallback
+        return f"[{target_lang}] {text} (error: {str(e)})"
 
 
-@retry(
-    stop=stop_after_attempt(int(os.getenv("MAX_RETRIES", "3"))),
-    wait=wait_exponential(
-        multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "1")), max=10
-    ),
-    retry=retry_if_exception_type(TransientHTTPError),
-    reraise=True,
-)
-def translate_text(text: str, cfg: TranslationConfig) -> str:
+# --------------------------------------------------------
+# Public function – try to be backward compatible
+# --------------------------------------------------------
+def translate_text(text: str, cfg_or_lang: Union[TranslationConfig, str, None] = None) -> str:
     """
-    Demo translator stub.
+    Main entry point used by your FastAPI app.
 
-    If OFFLINE_MODE=true or no OPENAI_API_KEY, it returns a mock translation.
-    Otherwise, this simulates a real translation API call.
+    Supports BOTH:
+        translate_text("Hello", "es")
+    and:
+        translate_text("Hello", TranslationConfig("es"))
+
+    If no key or API fails, returns a simple fallback.
     """
-    if not text.strip():
-        return ""
+    # no text
+    if not text or not text.strip():
+      return ""
 
-    # Offline mode: skip network call
-    if os.getenv("OFFLINE_MODE", "false").lower() == "true" or not os.getenv(
-        "OPENAI_API_KEY"
-    ):
-        return f"[{cfg.target_lang}] {text}"
+    # figure out target language
+    if isinstance(cfg_or_lang, TranslationConfig):
+        target_lang = cfg_or_lang.target_lang
+        timeout = cfg_or_lang.timeout
+    elif isinstance(cfg_or_lang, str):
+        target_lang = cfg_or_lang
+        timeout = 30
+    else:
+        # default to Spanish
+        target_lang = "es"
+        timeout = 30
 
-    # Example (replace with real API URL later)
-    result = _http_post_json(
-        "http://127.0.0.1:9/fake",
-        {"text": text, "lang": cfg.target_lang},
-        cfg.timeout,
-    )
-    return result.get("translation", f"[{cfg.target_lang}] {text}")
+    # finally try OpenAI
+    return _openai_translate(text, target_lang, timeout)
 
 
-__all__ = ["translate_text", "TranslationConfig", "TransientHTTPError"]
+__all__ = ["translate_text", "TranslationConfig"]
