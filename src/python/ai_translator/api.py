@@ -16,7 +16,7 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------
-# CORS – allow your site(s)
+# CORS – allow your sites to call this API
 # ---------------------------------------------------------
 origins = [
     "https://voyadecir.com",
@@ -33,9 +33,10 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------
-# helper: run a system command
+# helper to run system commands
 # ---------------------------------------------------------
 def run_cmd(cmd: list[str]):
+    """Run a system command and return (ok, stdout, stderr)."""
     try:
         proc = subprocess.run(
             cmd,
@@ -81,7 +82,7 @@ def health_check():
     }
 
 # ---------------------------------------------------------
-# form translate (keep)
+# form-style translate (kept)
 # ---------------------------------------------------------
 @app.post("/translate")
 async def translate_form(
@@ -95,7 +96,7 @@ async def translate_form(
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ---------------------------------------------------------
-# JSON translate – website uses this
+# JSON translate – this is what your website calls
 # ---------------------------------------------------------
 @app.post("/api/translate")
 async def translate_json(request: Request):
@@ -124,21 +125,29 @@ async def translate_json(request: Request):
 # ---------------------------------------------------------
 @app.post("/translate-pdf")
 async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
+    """
+    Uses the tools Render says you have:
+    - /usr/bin/pdftoppm to convert first page → PNG
+    - /usr/bin/tesseract to OCR that PNG
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         pdf_path = Path(tmpdir) / "input.pdf"
         with open(pdf_path, "wb") as f:
             f.write(await file.read())
 
-        # PDF → PNG (first page)
+        # PDF → PNG (first page only)
         png_prefix = Path(tmpdir) / "page"
-        ok, out, err = run_cmd([
-            "/usr/bin/pdftoppm",
-            str(pdf_path),
-            str(png_prefix),
-            "-png",
-            "-f", "1",
-            "-singlefile",
-        ])
+        ok, out, err = run_cmd(
+            [
+                "/usr/bin/pdftoppm",
+                str(pdf_path),
+                str(png_prefix),
+                "-png",
+                "-f",
+                "1",
+                "-singlefile",
+            ]
+        )
         if not ok:
             return JSONResponse(
                 status_code=500,
@@ -154,12 +163,15 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
 
         # OCR with tesseract
         txt_out = Path(tmpdir) / "out"
-        ok, out, err = run_cmd([
-            "/usr/bin/tesseract",
-            str(png_path),
-            str(txt_out),
-            "-l", "eng+spa",
-        ])
+        ok, out, err = run_cmd(
+            [
+                "/usr/bin/tesseract",
+                str(png_path),
+                str(txt_out),
+                "-l",
+                "eng+spa",
+            ]
+        )
         if not ok:
             return JSONResponse(
                 status_code=500,
@@ -180,6 +192,7 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
                 content={"warning": "OCR succeeded but no text found in PDF."},
             )
 
+        # translate the OCR text
         translated = translate_text(source_text, target_lang)
         return {
             "source_text": source_text,
@@ -188,85 +201,25 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
         }
 
 # ---------------------------------------------------------
-# Image upload → tesseract directly → translate
-# (simplified to avoid ImageMagick issues)
+# IMAGE upload – SAFE STUB (always 200)
 # ---------------------------------------------------------
 @app.post("/translate-image")
 async def translate_image(file: UploadFile, target_lang: str = Form("es")):
     """
-    1. save image
-    2. run tesseract directly on it
-    3. translate text
+    For now we just accept the image and return a friendly message.
+    This avoids 500 errors while we finish real image OCR.
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        img_path = Path(tmpdir) / file.filename
-        with open(img_path, "wb") as f:
-            f.write(await file.read())
-
-        # try OCR
-        txt_out = Path(tmpdir) / "imgout"
-        ok, out, err = run_cmd([
-            "/usr/bin/tesseract",
-            str(img_path),
-            str(txt_out),
-            "-l", "eng+spa",
-        ])
-
-        if not ok:
-            # try again with just english
-            ok2, out2, err2 = run_cmd([
-                "/usr/bin/tesseract",
-                str(img_path),
-                str(txt_out),
-                "-l", "eng",
-            ])
-            if not ok2:
-                # return friendly message instead of 500
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "warning": "Image received but OCR could not read it.",
-                        "stderr": err2 or err,
-                    },
-                )
-
-        txt_file = Path(str(txt_out) + ".txt")
-        if not txt_file.exists():
-            return JSONResponse(
-                status_code=200,
-                content={"warning": "OCR ran but no text file was produced."},
-            )
-
-        source_text = txt_file.read_text(encoding="utf-8", errors="ignore").strip()
-        if not source_text:
-            return JSONResponse(
-                status_code=200,
-                content={"warning": "OCR ran but found no text in the image."},
-            )
-
-        # translate the text we found
-        try:
-            translated = translate_text(source_text, target_lang)
-        except Exception as e:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "warning": "OCR worked, but translation failed.",
-                    "source_text": source_text,
-                    "error": str(e),
-                },
-            )
-
-        return {
-            "source_text": source_text,
-            "translated_text": translated,
-            "target_lang": target_lang,
-        }
+    return {
+        "warning": "Image received ✅ — image OCR is not enabled on the server yet.",
+        "filename": file.filename,
+        "target_lang": target_lang,
+    }
 
 # ---------------------------------------------------------
 # local run
 # ---------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("ai_translator.api:app", host="0.0.0.0", port=port, reload=True)
