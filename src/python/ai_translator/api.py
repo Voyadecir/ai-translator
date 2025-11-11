@@ -3,9 +3,24 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 from pathlib import Path
+import tempfile
 
 from ai_translator.utils.health import check_health
 from ai_translator.translate.client import translate_text
+
+# try to import OCR helpers, but don't die if not installed
+try:
+    import pytesseract
+    from PIL import Image
+except Exception:
+    pytesseract = None
+    Image = None
+
+# optional: PDF → images
+try:
+    from pdf2image import convert_from_path
+except Exception:
+    convert_from_path = None
 
 app = FastAPI(
     title="AI Translator API",
@@ -14,12 +29,12 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------
-# CORS: allow your website to call this API
+# CORS – allow your website
 # ---------------------------------------------------------
 origins = [
     "https://voyadecir.com",
     "https://www.voyadecir.com",
-    "https://voyadecir-site.onrender.com"  # your static site on Render
+    "https://voyadecir-site.onrender.com",
 ]
 
 app.add_middleware(
@@ -31,18 +46,18 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------
-# Root
+# root
 # ---------------------------------------------------------
 @app.get("/")
 def root():
     return {
         "message": "🎉 Welcome to the AI Translator API!",
         "status": "live",
-        "endpoints": ["/translate", "/api/translate", "/translate-pdf", "/health"],
+        "endpoints": ["/translate", "/api/translate", "/translate-pdf", "/translate-image", "/health"],
     }
 
 # ---------------------------------------------------------
-# Health
+# health
 # ---------------------------------------------------------
 @app.get("/health")
 def health_check():
@@ -56,7 +71,7 @@ def health_check():
     }
 
 # ---------------------------------------------------------
-# OLD form-style translate (keep)
+# form translate (kept)
 # ---------------------------------------------------------
 @app.post("/translate")
 async def translate_form(
@@ -70,7 +85,7 @@ async def translate_form(
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ---------------------------------------------------------
-# NEW JSON translate – this is what your website calls
+# JSON translate (used by your website)
 # ---------------------------------------------------------
 @app.post("/api/translate")
 async def translate_json(request: Request):
@@ -89,35 +104,94 @@ async def translate_json(request: Request):
             "target_lang": target_lang,
         }
     except Exception as e:
-        # if translation blows up, at least return something
         return JSONResponse(
             status_code=500,
-            content={
-                "error": str(e),
-                "hint": "Translator raised an error on the server."
-            },
+            content={"error": str(e), "hint": "Translator raised an error."},
         )
 
 # ---------------------------------------------------------
-# PDF upload (kept)
+# PDF upload → OCR → translate
 # ---------------------------------------------------------
 @app.post("/translate-pdf")
 async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
-    pdf_dir = Path("pdfs")
-    pdf_dir.mkdir(exist_ok=True)
-    temp_path = pdf_dir / file.filename
+    """
+    1. Save uploaded PDF
+    2. If pdf2image + tesseract available → OCR → translate
+    3. Otherwise return a friendly message
+    """
+    # save temp
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(await file.read())
+        pdf_path = tmp.name
 
-    with open(temp_path, "wb") as f:
-        f.write(await file.read())
-
-    return {
-        "file": file.filename,
-        "target_lang": target_lang,
-        "status": "Uploaded successfully",
-    }
+    if convert_from_path and pytesseract:
+        # convert first page to image and OCR it
+        try:
+            images = convert_from_path(pdf_path, first_page=1, last_page=1)
+            if images:
+                text = pytesseract.image_to_string(images[0])
+                translated = translate_text(text, target_lang)
+                return {
+                    "source_text": text,
+                    "translated_text": translated,
+                    "target_lang": target_lang,
+                }
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"OCR failed: {str(e)}"},
+            )
+    # fallback
+    return JSONResponse(
+        status_code=200,
+        content={
+            "warning": "OCR not available on server. PDF received but not processed.",
+            "filename": file.filename,
+            "target_lang": target_lang,
+        },
+    )
 
 # ---------------------------------------------------------
-# Local run
+# Image upload → OCR → translate
+# ---------------------------------------------------------
+@app.post("/translate-image")
+async def translate_image(file: UploadFile, target_lang: str = Form("es")):
+    """
+    1. Accept image (from camera or upload)
+    2. OCR it with tesseract
+    3. Translate text
+    """
+    if not (pytesseract and Image):
+        return JSONResponse(
+            status_code=200,
+            content={
+                "warning": "OCR not available on server.",
+                "target_lang": target_lang,
+            },
+        )
+
+    # save to temp and open
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        tmp.write(await file.read())
+        img_path = tmp.name
+
+    try:
+        img = Image.open(img_path)
+        text = pytesseract.image_to_string(img)
+        translated = translate_text(text, target_lang)
+        return {
+            "source_text": text,
+            "translated_text": translated,
+            "target_lang": target_lang,
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Image OCR failed: {str(e)}"},
+        )
+
+# ---------------------------------------------------------
+# local run
 # ---------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
