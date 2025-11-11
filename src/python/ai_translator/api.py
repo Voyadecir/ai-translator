@@ -33,10 +33,9 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------
-# helper: run system command
+# helper: run a system command
 # ---------------------------------------------------------
 def run_cmd(cmd: list[str]):
-    """Run a system command and return (ok, stdout, stderr)."""
     try:
         proc = subprocess.run(
             cmd,
@@ -74,15 +73,15 @@ def root():
 def health_check():
     health = check_health()
     return {
-      "tesseract": str(health.tesseract_path),
-      "poppler": str(health.poppler_path),
-      "magick": str(health.magick_path),
-      "internet_ok": health.internet_ok,
-      "openai_key_present": health.openai_key_present,
+        "tesseract": str(health.tesseract_path),
+        "poppler": str(health.poppler_path),
+        "magick": str(health.magick_path),
+        "internet_ok": health.internet_ok,
+        "openai_key_present": health.openai_key_present,
     }
 
 # ---------------------------------------------------------
-# form translate (kept for compatibility)
+# form translate (keep)
 # ---------------------------------------------------------
 @app.post("/translate")
 async def translate_form(
@@ -96,7 +95,7 @@ async def translate_form(
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ---------------------------------------------------------
-# JSON translate – used by your website
+# JSON translate – website uses this
 # ---------------------------------------------------------
 @app.post("/api/translate")
 async def translate_json(request: Request):
@@ -130,7 +129,7 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
         with open(pdf_path, "wb") as f:
             f.write(await file.read())
 
-        # PDF → PNG
+        # PDF → PNG (first page)
         png_prefix = Path(tmpdir) / "page"
         ok, out, err = run_cmd([
             "/usr/bin/pdftoppm",
@@ -153,7 +152,7 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
                 content={"error": "PDF converted but page.png not found."},
             )
 
-        # OCR
+        # OCR with tesseract
         txt_out = Path(tmpdir) / "out"
         ok, out, err = run_cmd([
             "/usr/bin/tesseract",
@@ -189,75 +188,47 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
         }
 
 # ---------------------------------------------------------
-# Image upload → (magick/convert) → tesseract → translate
+# Image upload → tesseract directly → translate
+# (simplified to avoid ImageMagick issues)
 # ---------------------------------------------------------
 @app.post("/translate-image")
 async def translate_image(file: UploadFile, target_lang: str = Form("es")):
     """
     1. save image
-    2. try to normalize to PNG using /usr/bin/magick or /usr/bin/convert
-    3. run tesseract
-    4. translate
+    2. run tesseract directly on it
+    3. translate text
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        # save raw upload
-        raw_path = Path(tmpdir) / file.filename
-        with open(raw_path, "wb") as f:
+        img_path = Path(tmpdir) / file.filename
+        with open(img_path, "wb") as f:
             f.write(await file.read())
 
-        # try to convert to png
-        png_path = Path(tmpdir) / "input.png"
-        converted = False
-
-        # try /usr/bin/magick
-        ok, _, _ = run_cmd([
-            "/usr/bin/magick",
-            str(raw_path),
-            str(png_path),
-        ])
-        if ok and png_path.exists():
-            converted = True
-        else:
-            # try /usr/bin/convert (older ImageMagick)
-            ok2, _, _ = run_cmd([
-                "/usr/bin/convert",
-                str(raw_path),
-                str(png_path),
-            ])
-            if ok2 and png_path.exists():
-                converted = True
-
-        # if neither worked, just use the original image
-        img_for_ocr = png_path if converted else raw_path
-
-        # run tesseract
+        # try OCR
         txt_out = Path(tmpdir) / "imgout"
-        # first try with eng+spa
         ok, out, err = run_cmd([
             "/usr/bin/tesseract",
-            str(img_for_ocr),
+            str(img_path),
             str(txt_out),
             "-l", "eng+spa",
         ])
 
-        # if that fails (maybe spa not installed), try just eng
         if not ok:
-            ok, out, err = run_cmd([
+            # try again with just english
+            ok2, out2, err2 = run_cmd([
                 "/usr/bin/tesseract",
-                str(img_for_ocr),
+                str(img_path),
                 str(txt_out),
                 "-l", "eng",
             ])
-
-        if not ok:
-            # return friendly error instead of 500 mystery
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "warning": "Image received but OCR could not read it.",
-                    "stderr": err,
-                },
-            )
+            if not ok2:
+                # return friendly message instead of 500
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "warning": "Image received but OCR could not read it.",
+                        "stderr": err2 or err,
+                    },
+                )
 
         txt_file = Path(str(txt_out) + ".txt")
         if not txt_file.exists():
@@ -273,8 +244,19 @@ async def translate_image(file: UploadFile, target_lang: str = Form("es")):
                 content={"warning": "OCR ran but found no text in the image."},
             )
 
-        # translate extracted text
-        translated = translate_text(source_text, target_lang)
+        # translate the text we found
+        try:
+            translated = translate_text(source_text, target_lang)
+        except Exception as e:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "warning": "OCR worked, but translation failed.",
+                    "source_text": source_text,
+                    "error": str(e),
+                },
+            )
+
         return {
             "source_text": source_text,
             "translated_text": translated,
