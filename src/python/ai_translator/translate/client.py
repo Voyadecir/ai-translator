@@ -1,108 +1,102 @@
 from __future__ import annotations
+
 import os
-import json
 from dataclasses import dataclass
-from typing import Union
-import urllib.request
-import urllib.error
+
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 
-# --------------------------------------------------------
-# Config object (kept so old code doesn't break)
-# --------------------------------------------------------
+# -----------------------------
+# Config + Exceptions
+# -----------------------------
 @dataclass
 class TranslationConfig:
     target_lang: str
-    timeout: int = 30
+    timeout: float = 15.0
 
 
-# --------------------------------------------------------
-# Helper: call OpenAI's API using urllib (no extra deps)
-# --------------------------------------------------------
-def _openai_translate(text: str, target_lang: str, timeout: int = 30) -> str:
+class TransientHTTPError(Exception):
+    """Network/provider hiccup that is worth retrying."""
+    pass
+
+
+# -----------------------------
+# Provider call
+# -----------------------------
+async def _openai_translate(text: str, target_lang: str, timeout: float) -> str:
     """
-    Call OpenAI API to translate text into target_lang.
-    We keep it simple: system prompt + user text.
+    Minimal OpenAI chat call for translation.
+    Uses GPT-4o-mini by default. Outputs ONLY the translated text.
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        # no key? return fallback
+        # no key → predictable fallback
         return f"[{target_lang}] {text}"
 
     url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-
-    # You can change the model if you have a better one on your account
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
-        "model": "gpt-4o-mini",
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are a translation assistant. "
-                    "Translate the user's text into the exact target language. "
-                    "Return ONLY the translated text, no explanations."
-                ),
+                "content": "You are a professional translator. Keep meaning, tone, and formatting. Output only the translated text."
             },
             {
                 "role": "user",
-                "content": f"Translate this into {target_lang}:\n{text}",
+                "content": f"Translate to {target_lang}:\n\n{text}"
             },
         ],
         "temperature": 0.2,
     }
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        # retry on 5xx, not on most 4xx
+        if resp.status_code >= 500:
+            raise TransientHTTPError(f"OpenAI {resp.status_code}: {resp.text}")
+        if resp.status_code >= 400:
+            # surface the body; caller will fallback upstack
+            raise RuntimeError(f"OpenAI {resp.status_code}: {resp.text}")
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            parsed = json.loads(raw)
-            return parsed["choices"][0]["message"]["content"].strip()
-    except urllib.error.HTTPError as e:
-        # If OpenAI says no (bad key, no credit, etc), fall back
-        return f"[{target_lang}] {text} (openai error: {e.code})"
-    except Exception as e:
-        # any other network error: fallback
-        return f"[{target_lang}] {text} (error: {str(e)})"
+        data = resp.json()
+        out = (
+            data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+        )
+        if not out:
+            raise RuntimeError("Empty translation from provider")
+        return out
 
 
-# --------------------------------------------------------
-# Public function – try to be backward compatible
-# --------------------------------------------------------
-def translate_text(text: str, cfg_or_lang: Union[TranslationConfig, str, None] = None) -> str:
+# -----------------------------
+# Public API
+# -----------------------------
+@retry(
+    stop=stop_after_attempt(int(os.getenv("MAX_RETRIES", "2"))),
+    wait=wait_exponential(multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "0.8")), max=6),
+    retry=retry_if_exception_type(TransientHTTPError),
+    reraise=True,
+)
+async def translate_text(text: str, target_lang: str) -> str:
     """
-    Main entry point used by your FastAPI app.
-
-    Supports BOTH:
-        translate_text("Hello", "es")
-    and:
-        translate_text("Hello", TranslationConfig("es"))
-
-    If no key or API fails, returns a simple fallback.
+    Translate given text to target_lang.
+    Strategy:
+      1) If OFFLINE_MODE=true → mock translation.
+      2) If OPENAI_API_KEY present → use OpenAI.
+      3) Last resort → bracketed echo.
     """
-    # no text
-    if not text or not text.strip():
-      return ""
+    text = (text or "").strip()
+    if not text:
+        return ""
 
-    # figure out target language
-    if isinstance(cfg_or_lang, TranslationConfig):
-        target_lang = cfg_or_lang.target_lang
-        timeout = cfg_or_lang.timeout
-    elif isinstance(cfg_or_lang, str):
-        target_lang = cfg_or_lang
-        timeout = 30
-    else:
-        # default to Spanish
-        target_lang = "es"
-        timeout = 30
+    if os.getenv("OFFLINE_MODE", "false").lower() == "true":
+        return f"[{target_lang}] {text}"
 
-    # finally try OpenAI
-    return _openai_translate(text, target_lang, timeout)
+    if os.getenv("OPENAI_API_KEY"):
+        return await _openai_translate(text, target_lang, timeout=float(os.getenv("HTTP_TIMEOUT_SECONDS", "15")))
 
-
-__all__ = ["translate_text", "TranslationConfig"]
+    return f"[{target_lang}] {text}"
