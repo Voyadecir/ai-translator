@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from fastapi import FastAPI, UploadFile, Form, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,12 +9,12 @@ import tempfile
 import subprocess
 
 from ai_translator.utils.health import check_health
-from ai_translator.translate.client import translate_text
+from ai_translator.translate.client import translate_text  # async in new client.py
 
 app = FastAPI(
     title="AI Translator API",
     description="Translate text or PDF content into your target language using AI. 🚀",
-    version="1.0.0",
+    version="1.2.0",
 )
 
 # ---------------------------------------------------------
@@ -22,6 +24,8 @@ origins = [
     "https://voyadecir.com",
     "https://www.voyadecir.com",
     "https://voyadecir-site.onrender.com",
+    # add your Azure Functions host later if needed, e.g.:
+    # "https://voyadecir-ai-functions.azurewebsites.net",
 ]
 
 app.add_middleware(
@@ -31,6 +35,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ---------------------------------------------------------
 # helper to run system commands
@@ -50,6 +55,7 @@ def run_cmd(cmd: list[str]):
     except Exception as e:
         return False, "", str(e)
 
+
 # ---------------------------------------------------------
 # root
 # ---------------------------------------------------------
@@ -65,7 +71,9 @@ def root():
             "/translate-image",
             "/health",
         ],
+        "version": "1.2.0",
     }
+
 
 # ---------------------------------------------------------
 # health
@@ -81,8 +89,9 @@ def health_check():
         "openai_key_present": health.openai_key_present,
     }
 
+
 # ---------------------------------------------------------
-# form-style translate (kept)
+# form-style translate (kept)  ← now awaits async translate_text
 # ---------------------------------------------------------
 @app.post("/translate")
 async def translate_form(
@@ -90,25 +99,30 @@ async def translate_form(
     target_lang: str = Form("es"),
 ):
     try:
-        translated = translate_text(text, target_lang)
+        translated = await translate_text(text, target_lang)
         return {"original": text, "translated": translated, "target_lang": target_lang}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
 # ---------------------------------------------------------
-# JSON translate – this is what your website calls
+# JSON translate – this is what your website calls  ← awaits too
 # ---------------------------------------------------------
 @app.post("/api/translate")
 async def translate_json(request: Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
     text = (data.get("text") or "").strip()
-    target_lang = data.get("target_lang", "es")
+    target_lang = (data.get("target_lang") or "es").strip()
 
     if not text:
         return JSONResponse(status_code=400, content={"error": "No text provided."})
 
     try:
-        translated = translate_text(text, target_lang)
+        translated = await translate_text(text, target_lang)
         return {
             "original_text": text,
             "translated_text": translated,
@@ -120,8 +134,9 @@ async def translate_json(request: Request):
             content={"error": str(e), "hint": "Translator raised an error."},
         )
 
+
 # ---------------------------------------------------------
-# PDF upload → pdftoppm → tesseract → translate
+# PDF upload → pdftoppm → tesseract → translate  ← awaits at the end
 # ---------------------------------------------------------
 @app.post("/translate-pdf")
 async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
@@ -132,8 +147,10 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         pdf_path = Path(tmpdir) / "input.pdf"
+        # read file once
+        pdf_bytes = await file.read()
         with open(pdf_path, "wb") as f:
-            f.write(await file.read())
+            f.write(pdf_bytes)
 
         # PDF → PNG (first page only)
         png_prefix = Path(tmpdir) / "page"
@@ -192,13 +209,14 @@ async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
                 content={"warning": "OCR succeeded but no text found in PDF."},
             )
 
-        # translate the OCR text
-        translated = translate_text(source_text, target_lang)
+        # translate the OCR text (async)
+        translated = await translate_text(source_text, target_lang)
         return {
             "source_text": source_text,
             "translated_text": translated,
             "target_lang": target_lang,
         }
+
 
 # ---------------------------------------------------------
 # IMAGE upload – SAFE STUB (always 200)
@@ -214,6 +232,7 @@ async def translate_image(file: UploadFile, target_lang: str = Form("es")):
         "filename": file.filename,
         "target_lang": target_lang,
     }
+
 
 # ---------------------------------------------------------
 # local run
