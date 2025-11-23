@@ -1,244 +1,106 @@
-from __future__ import annotations
-
-from fastapi import FastAPI, UploadFile, Form, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import os
-from pathlib import Path
-import tempfile
-import subprocess
-
-from ai_translator.utils.health import check_health
-from ai_translator.translate.client import translate_text  # async in new client.py
-
-app = FastAPI(
-    title="AI Translator API",
-    description="Translate text or PDF content into your target language using AI. 🚀",
-    version="1.2.0",
-)
-
-# ---------------------------------------------------------
-# CORS – allow your sites to call this API
-# ---------------------------------------------------------
-origins = [
-    "https://voyadecir.com",
-    "https://www.voyadecir.com",
-    "https://voyadecir-site.onrender.com",
-    # add your Azure Functions host later if needed, e.g.:
-    # "https://voyadecir-ai-functions.azurewebsites.net",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------------------------------------
-# helper to run system commands
-# ---------------------------------------------------------
-def run_cmd(cmd: list[str]):
-    """Run a system command and return (ok, stdout, stderr)."""
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            text=True,
-        )
-        ok = proc.returncode == 0
-        return ok, proc.stdout.strip(), proc.stderr.strip()
-    except Exception as e:
-        return False, "", str(e)
-
-
-# ---------------------------------------------------------
-# root
-# ---------------------------------------------------------
-@app.get("/")
-def root():
-    return {
-        "message": "🎉 Welcome to the AI Translator API!",
-        "status": "live",
-        "endpoints": [
-            "/translate",
-            "/api/translate",
-            "/translate-pdf",
-            "/translate-image",
-            "/health",
-        ],
-        "version": "1.2.0",
-    }
-
-
-# ---------------------------------------------------------
-# health
-# ---------------------------------------------------------
-@app.get("/health")
-def health_check():
-    health = check_health()
-    return {
-        "tesseract": str(health.tesseract_path),
-        "poppler": str(health.poppler_path),
-        "magick": str(health.magick_path),
-        "internet_ok": health.internet_ok,
-        "openai_key_present": health.openai_key_present,
-    }
-
-
-# ---------------------------------------------------------
-# form-style translate (kept)  ← now awaits async translate_text
-# ---------------------------------------------------------
-@app.post("/translate")
-async def translate_form(
-    text: str = Form(...),
-    target_lang: str = Form("es"),
-):
-    try:
-        translated = await translate_text(text, target_lang)
-        return {"original": text, "translated": translated, "target_lang": target_lang}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-# ---------------------------------------------------------
-# JSON translate – this is what your website calls  ← awaits too
-# ---------------------------------------------------------
-@app.post("/api/translate")
-async def translate_json(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
-
-    text = (data.get("text") or "").strip()
-    target_lang = (data.get("target_lang") or "es").strip()
-
-    if not text:
-        return JSONResponse(status_code=400, content={"error": "No text provided."})
-
-    try:
-        translated = await translate_text(text, target_lang)
-        return {
-            "original_text": text,
-            "translated_text": translated,
-            "target_lang": target_lang,
-        }
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e), "hint": "Translator raised an error."},
-        )
-
-
-# ---------------------------------------------------------
-# PDF upload → pdftoppm → tesseract → translate  ← awaits at the end
-# ---------------------------------------------------------
-@app.post("/translate-pdf")
-async def translate_pdf(file: UploadFile, target_lang: str = Form("es")):
-    """
-    Uses the tools Render says you have:
-    - /usr/bin/pdftoppm to convert first page → PNG
-    - /usr/bin/tesseract to OCR that PNG
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        pdf_path = Path(tmpdir) / "input.pdf"
-        # read file once
-        pdf_bytes = await file.read()
-        with open(pdf_path, "wb") as f:
-            f.write(pdf_bytes)
-
-        # PDF → PNG (first page only)
-        png_prefix = Path(tmpdir) / "page"
-        ok, out, err = run_cmd(
-            [
-                "/usr/bin/pdftoppm",
-                str(pdf_path),
-                str(png_prefix),
-                "-png",
-                "-f",
-                "1",
-                "-singlefile",
-            ]
-        )
-        if not ok:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "pdftoppm failed", "stderr": err},
-            )
-
-        png_path = Path(tmpdir) / "page.png"
-        if not png_path.exists():
-            return JSONResponse(
-                status_code=500,
-                content={"error": "PDF converted but page.png not found."},
-            )
-
-        # OCR with tesseract
-        txt_out = Path(tmpdir) / "out"
-        ok, out, err = run_cmd(
-            [
-                "/usr/bin/tesseract",
-                str(png_path),
-                str(txt_out),
-                "-l",
-                "eng+spa",
-            ]
-        )
-        if not ok:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "tesseract failed", "stderr": err},
-            )
-
-        txt_file = Path(str(txt_out) + ".txt")
-        if not txt_file.exists():
-            return JSONResponse(
-                status_code=500,
-                content={"error": "tesseract did not produce text file."},
-            )
-
-        source_text = txt_file.read_text(encoding="utf-8", errors="ignore").strip()
-        if not source_text:
-            return JSONResponse(
-                status_code=200,
-                content={"warning": "OCR succeeded but no text found in PDF."},
-            )
-
-        # translate the OCR text (async)
-        translated = await translate_text(source_text, target_lang)
-        return {
-            "source_text": source_text,
-            "translated_text": translated,
-            "target_lang": target_lang,
-        }
-
-
-# ---------------------------------------------------------
-# IMAGE upload – SAFE STUB (always 200)
-# ---------------------------------------------------------
-@app.post("/translate-image")
-async def translate_image(file: UploadFile, target_lang: str = Form("es")):
-    """
-    For now we just accept the image and return a friendly message.
-    This avoids 500 errors while we finish real image OCR.
-    """
-    return {
-        "warning": "Image received ✅ — image OCR is not enabled on the server yet.",
-        "filename": file.filename,
-        "target_lang": target_lang,
-    }
-
-
-# ---------------------------------------------------------
-# local run
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("ai_translator.api:app", host="0.0.0.0", port=port, reload=True)
+diff --git a/ai_translator/api.py b/ai_translator/api.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eafd8a5aebf8cd5ea497bf96a57954cdd90f98fa
+--- /dev/null
++++ b/ai_translator/api.py
+@@ -0,0 +1,100 @@
++import logging
++from typing import Dict, Optional
++
++from fastapi import FastAPI, File, UploadFile
++from fastapi.responses import JSONResponse
++
++from . import config
++from .ocr import (
++    OcrResult,
++    StageError,
++    build_stage_error_response,
++    call_azure_read,
++    preprocess_bytes,
++    run_tesseract,
++)
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger(__name__)
++
++app = FastAPI(title="Voyadecir OCR Backend")
++
++
++@app.post("/api/ocr-debug")
++async def ocr_debug(file: UploadFile = File(...)):
++    stages: Dict[str, object] = {}
++    try:
++        raw_bytes = await file.read()
++        if not raw_bytes:
++            raise StageError("upload_parse", "Uploaded file is empty")
++        content_type = file.content_type or ""
++        stages["upload_parse"] = {
++            "status": "ok",
++            "content_type": content_type,
++            "size_bytes": len(raw_bytes),
++            "filename": file.filename,
++            "magic": raw_bytes[:12].hex(),
++        }
++    except StageError as exc:
++        return JSONResponse(status_code=400, content=build_stage_error_response(exc.stage, exc.message, stages))
++    except Exception as exc:  # pragma: no cover - defensive
++        return JSONResponse(status_code=400, content=build_stage_error_response("upload_parse", str(exc), stages))
++
++    try:
++        preprocessed, preprocess_meta, render_format = preprocess_bytes(raw_bytes, content_type)
++        stages.update(preprocess_meta)
++    except StageError as exc:
++        return JSONResponse(status_code=400, content=build_stage_error_response(exc.stage, exc.message, stages))
++
++    payload_bytes, payload_type = _prepare_payload(preprocessed, render_format)
++
++    try:
++        azure_result: Optional[OcrResult] = None
++        try:
++            azure_result = await call_azure_read(payload_bytes, payload_type, stages)
++        except StageError as exc:
++            stages["azure_read_call"] = {"status": "error", "reason": exc.message}
++        except Exception as exc:  # pragma: no cover - defensive
++            stages["azure_read_call"] = {"status": "error", "reason": str(exc)}
++
++        final_result: OcrResult
++        if azure_result and azure_result.confidence >= config.CONFIDENCE_THRESHOLD:
++            final_result = azure_result
++            stages["fallback_call"] = "skipped"
++        else:
++            if azure_result:
++                stages["azure_read_call"] = {
++                    "status": "ok_but_low_confidence",
++                    "confidence": azure_result.confidence,
++                    "threshold": config.CONFIDENCE_THRESHOLD,
++                }
++            stages["fallback_call"] = "running"
++            try:
++                final_result = run_tesseract(preprocessed)
++            except StageError as exc:
++                return JSONResponse(status_code=500, content=build_stage_error_response(exc.stage, exc.message, stages))
++            except Exception as exc:  # pragma: no cover - defensive
++                return JSONResponse(status_code=500, content=build_stage_error_response("fallback_call", str(exc), stages))
++            stages["fallback_call"] = "ok"
++
++        text_preview = (final_result.text or "").strip().replace("\n", " ")
++        if len(text_preview) > 200:
++            text_preview = text_preview[:200] + "..."
++
++        response_body = {
++            "engine_used": final_result.engine_used,
++            "stages": stages,
++            "confidence": round(final_result.confidence, 3),
++            "text_preview": text_preview,
++            "full_text": final_result.text,
++        }
++        return JSONResponse(status_code=200, content=response_body)
++    except Exception as exc:  # pragma: no cover - defensive
++        return JSONResponse(status_code=500, content=build_stage_error_response("unexpected", str(exc), stages))
++
++
++def _prepare_payload(preprocessed, render_format: str):
++    from .ocr import _images_to_bytes
++
++    payload_bytes, payload_type = _images_to_bytes(preprocessed, render_format)
++    return payload_bytes, payload_type
