@@ -1,0 +1,26 @@
+diff --git a/ai_translator/config.py b/ai_translator/config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d96b30bafaeb38e49d9d1cfc421be0a91750e6a
+--- /dev/null
++++ b/ai_translator/config.py
+@@ -0,0 +1,20 @@
++import os
++from typing import Optional
++
++
++def get_env_bool(name: str, default: bool = False) -> bool:
++    value = os.getenv(name)
++    if value is None:
++        return default
++    return value.lower() in {"1", "true", "yes", "on"}
++
++
++AZURE_DI_ENDPOINT: Optional[str] = os.getenv("AZURE_DI_ENDPOINT")
++AZURE_DI_API_KEY: Optional[str] = os.getenv("AZURE_DI_API_KEY")
++AZURE_DI_API_VERSION: str = os.getenv("AZURE_DI_API_VERSION", "2024-02-29-preview")
++AZURE_DI_MODEL: str = os.getenv("AZURE_DI_MODEL", "prebuilt-read")
++HTTP_TIMEOUT_SECONDS: int = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
++OFFLINE_MODE: bool = get_env_bool("OFFLINE_MODE", False)
++CONFIDENCE_THRESHOLD: float = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.75"))
++DEBUG_SAVE: bool = get_env_bool("OCR_DEBUG_SAVE", False)
++DEBUG_DIR: str = os.getenv("OCR_DEBUG_DIR", "/tmp/ocr_debug")
