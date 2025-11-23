@@ -11,7 +11,7 @@ def get_env_bool(name: str, default: bool = False) -> bool:
 
 AZURE_DI_ENDPOINT: Optional[str] = os.getenv("AZURE_DI_ENDPOINT")
 AZURE_DI_API_KEY: Optional[str] = os.getenv("AZURE_DI_API_KEY")
-AZURE_DI_API_VERSION: str = os.getenv("AZURE_DI_API_VERSION", "2024-02-29-preview")
+AZURE_DI_API_VERSION: str = os.getenv("AZURE_DI_API_VERSION", "2024-07-31")
 AZURE_DI_MODEL: str = os.getenv("AZURE_DI_MODEL", "prebuilt-read")
 HTTP_TIMEOUT_SECONDS: int = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
 OFFLINE_MODE: bool = get_env_bool("OFFLINE_MODE", False)
