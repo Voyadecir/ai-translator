@@ -1,43 +1,46 @@
-# Voyadecir — Deployment Guide (Static Site + API)
+# README_DEPLOY.md — Voyadecir Deployment Guide (Updated)
 
-Minimalist bilingual (EN/ES) static site + FastAPI backend on Render.
-Goal: unified Translate + Bills/Mail hub, plus Azure-first OCR + Azure OpenAI.
+Minimalist bilingual static site + FastAPI backend on Render.  
+Goal: one unified Translate + Bills/Mail hub with Azure-first OCR + Azure OpenAI.
 
 ---
 
 ## What’s Live Right Now
 **Two Render services:**
-1. **Static site**: `voyadecir-site`  
-   - Hosts the HTML/CSS/JS site (Home, unified Translate/Bills/Mail page, About, Contact, Privacy, Terms).
-   - Domain: `voyadecir.com` and `www.voyadecir.com` (SSL active).
 
-2. **API**: `ai-translator`  
-   - FastAPI app running in Docker.
-   - Public endpoint used by the website:
-     - `POST https://ai-translator-i5jb.onrender.com/api/translate`
-     - (Bills/Mail OCR endpoint may call Azure OCR first, fallback local OCR).
+1. **Static site**: `voyadecir-site`
+   - Hosts Home, Unified Hub, About, Contact, Privacy, Terms.
+   - Domain: voyadecir.com and www.voyadecir.com (SSL active).
+
+2. **API**: `ai-translator`
+   - FastAPI app in Docker.
+   - Public endpoints:
+     - `POST /api/translate`
+     - `POST /api/mailbills/parse` (OCR → translate → explain)
 
 ---
 
 ## Deploy / Update Static Site (Render)
-1. Render → **Static Site** → connect GitHub repo.
-2. **Build Command:** none  
-3. **Publish Directory:** `/`
-4. Push to `main` → Render auto-deploys.
+1. Render → Static Site → connect repo.
+2. Build command: none
+3. Publish dir: `/`
+4. Push to `main` → auto-deploy.
 
-**Unified page note:**  
-Translate + Bills/Mail now live on a **single hub page** (no longer separate translate.html + mail-bills.html). Any embeds or links should point to that hub.
+**Unified hub note:**  
+Translate + Bills/Mail are merged into ONE page.  
+If any legacy links exist, redirect them to the hub.
 
 ---
 
 ## Deploy / Update API (Render Docker)
-1. Render → **Web Service** → connect GitHub repo.
-2. Repo **must include a Dockerfile** at root.
-3. Render auto-builds on push to `main`.
+1. Render → Web Service → connect repo.
+2. Repo must include Dockerfile at root.
+3. Push to `main` → auto rebuild.
 
-**Dockerfile must start Uvicorn like:**
-```bash
-uvicorn ai_translator.api:app --host 0.0.0.0 --port $PORT
+**Dockerfile start command (single line):**  
+    uvicorn ai_translator.api:app --host 0.0.0.0 --port $PORT
+
+---
 
 ## Required Backend Dependencies
 
@@ -49,24 +52,24 @@ uvicorn ai_translator.api:app --host 0.0.0.0 --port $PORT
 - python-multipart
 - tenacity
 
-### System deps (installed in Dockerfile via apt):
+### System deps (Dockerfile via apt):
 - tesseract-ocr
+- tesseract-ocr-eng
+- tesseract-ocr-spa
 - poppler-utils
 - imagemagick
-
-These enable local OCR fallback.
 
 ---
 
 ## Environment Variables (Render → API Service)
 
-### Azure OpenAI (LLM)
+### Azure OpenAI
 - AZURE_OPENAI_ENDPOINT
 - AZURE_OPENAI_API_KEY
 - AZURE_OPENAI_DEPLOYMENT
 - AZURE_OPENAI_API_VERSION
 
-### Azure OCR (Document Intelligence Read) — PRIMARY OCR
+### Azure OCR (Document Intelligence Read)
 - AZURE_DI_ENDPOINT
 - AZURE_DI_API_KEY
 - AZURE_DI_API_VERSION
@@ -74,45 +77,46 @@ These enable local OCR fallback.
 
 ### App Settings
 - OFFLINE_MODE=false
-- OPENAI_MODEL=gpt-4o-mini  *(only if using non-Azure fallback)*
 - HTTP_TIMEOUT_SECONDS=15
+- OCR_CONFIDENCE_THRESHOLD=0.75 (optional)
+- DEBUG_OCR=false (optional)
 
 Important: never put keys in frontend code.
 
 ---
 
 ## CORS
-
 Backend must allow:
 - https://voyadecir.com
 - https://www.voyadecir.com
 
-If adding new frontends (mobile, staging), update CORS accordingly.
+Update allowlist if adding staging/mobile.
 
 ---
 
 ## Build / Deploy Flow
-1. Push to GitHub `main`
+1. Push to `main`
 2. Render auto-deploys:
-   - Static site updates instantly
+   - static updates immediately
    - API rebuilds Docker image
-3. If dependencies changed:
-   - Render → Clear build cache → Deploy
+3. If dependencies change:
+   - Clear build cache → Deploy
 
 ---
 
-## Known Gotchas (do not repeat history)
-- Missing `httpx` in requirements breaks deploys.
+## Known Gotchas
+- Missing `httpx` breaks deploys.
 - Missing Dockerfile breaks deploys.
-- OCR failures often come from missing Azure env vars or wrong Azure OCR endpoint.
-- Don’t blame CORS unless preflight is failing. If preflight succeeds and function dies fast, it’s inside the function.
+- If preflight succeeds and function dies fast, it’s internal, not CORS.
+- OCR failures usually = missing/wrong Azure env vars or wrong DI endpoint.
 
 ---
 
-## What’s Still Pending (P0)
-- Formspree contact wiring (if not already done).
-- Email capture.
-- Pricing gates (Free vs Pro) on unified hub.
-- OCR stabilization per OCR_DEBUG.md.
+## Still Pending (P0)
+- OCR stabilization per OCR_STABILIZATION.md
+- Unified hub merge + free/Pro gates
+- Formspree contact wiring
+- Email capture
+- SEO blocks on hub
 
-That’s it. Keep it boring, keep it stable, ship faster.
+Keep it simple. Ship it. Then sell it.
