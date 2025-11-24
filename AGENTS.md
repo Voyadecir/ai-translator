@@ -1,81 +1,101 @@
-# AGENTS.md — Voyadecir (Codex Instructions)
+# AGENTS.md — Voyadecir (Codex Instructions, Updated)
 
 ## Mission
-Build Voyadecir into a bilingual (EN/ES) translation + Bills & Mail Helper product and reach ~$6k MRR ASAP.
+Ship Voyadecir as a bilingual (EN/ES) Translate + Bills & Mail Helper product.
+Target: **$6k MRR ASAP** by shipping revenue-surface first.
+
 Primary differentiator: immigrant-focused OCR → translation → plain-language explanation for bills/USPS/mail.
 
+---
+
 ## Core Principles
-1. **Redundancy everywhere.**
-   - Every critical capability must have a fallback:
-     - OCR: Azure primary, local/other OCR backup.
-     - LLM: Azure OpenAI primary, alternate model/provider backup when available.
-     - Storage: primary DB + snapshot/export fallback.
-     - Agents: supervisor + retry + graceful degradation.
-     - Frontend & apps: cached last-known-good behavior when services fail.
+1. **Redundancy everywhere**
+   - OCR: Azure primary, local fallback
+   - LLM: Azure primary, fallback model if available
+   - Storage: primary + export/snapshot
+   - Agents: retries + graceful degradation
 
-2. **Ship revenue surface area first.**
-   - Fix OCR → unify web hub → pricing gates → promote → then expand agents/apps.
+2. **Ship revenue surface area first**
+   - P0 only until stable in production.
 
-3. **Minimalist Voyadecir UI.**
-   - Black/white aesthetic, sans-serif, clean spacing.
-   - No analytics by default unless explicitly requested.
+3. **Minimalist Voyadecir UI**
+   - black/white, sans-serif, clean spacing
+   - privacy-first, no analytics by default
 
-## Repos / Stack
+---
+
+## Stack
 ### Frontend
-- Static HTML/CSS/JS site hosted on Render.
-- Domain: voyadecir.com (and www).
-- Pages currently include translate + mail/bills (to be merged).
+- Static HTML/CSS/JS on Render
+- Domain: voyadecir.com (+ www)
+- **Unified hub page** (Translate + Bills/Mail in one)
 
 ### Backend
-- FastAPI on Render via Docker.
-- OCR + translation endpoints.
-- Environment-driven config.
+- FastAPI on Render via Docker
+- Endpoints:
+  - /api/translate
+  - /api/mailbills/parse (calls Azure OCR first, fallback local)
 
 ### Azure
-- Azure OpenAI for LLM.
-- **Azure Document Intelligence Read OCR (primary OCR engine).**
-- Azure Functions for OCR routing / mailbills parsing (current failure area). :contentReference[oaicite:1]{index=1}  
+- Azure OpenAI for LLM
+- Azure Document Intelligence Read OCR (primary)
+- Azure Functions for OCR routing / mailbills parsing
 
-## Setup (Codex cloud task)
-1. `pip install -r requirements.txt`
-2. Install system deps:
-   - `tesseract-ocr`
-   - `tesseract-ocr-eng`
-   - `tesseract-ocr-spa`
-   - `poppler-utils`
-   - `imagemagick`
+---
+
+## Dev Setup (Codex cloud tasks)
+1. Install deps: `pip install -r requirements.txt`
+2. System deps in Dockerfile:
+   - tesseract-ocr (+ eng + spa)
+   - poppler-utils
+   - imagemagick
 3. Export env vars (see below).
-4. Run tests: `pytest -q` (if present).
-5. Run API: `uvicorn ai_translator.api:app --host 0.0.0.0 --port 8000`
+4. Run API:  
+   `uvicorn ai_translator.api:app --host 0.0.0.0 --port 8000`
+
+---
 
 ## Env Vars
 ### Azure OpenAI
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_DEPLOYMENT`
-- `AZURE_OPENAI_API_VERSION` (use latest supported)
+- AZURE_OPENAI_ENDPOINT
+- AZURE_OPENAI_API_KEY
+- AZURE_OPENAI_DEPLOYMENT
+- AZURE_OPENAI_API_VERSION
 
-### Azure OCR (Document Intelligence Read)
-- `AZURE_DI_ENDPOINT`
-- `AZURE_DI_API_KEY`
-- `AZURE_DI_API_VERSION` (v4.0 GA)
-- `AZURE_DI_MODEL=prebuilt-read`
+### Azure OCR
+- AZURE_DI_ENDPOINT
+- AZURE_DI_API_KEY
+- AZURE_DI_API_VERSION
+- AZURE_DI_MODEL=prebuilt-read
 
 ### App Flags
-- `OFFLINE_MODE=false`
-- `HTTP_TIMEOUT_SECONDS=15`
+- OFFLINE_MODE=false
+- HTTP_TIMEOUT_SECONDS=15
+- OCR_CONFIDENCE_THRESHOLD=0.75 (optional)
+- DEBUG_OCR=false (optional)
 
-## Run Commands
-- API dev: `uvicorn ai_translator.api:app --reload`
-- API prod-like: `uvicorn ai_translator.api:app --host 0.0.0.0 --port $PORT`
-- Tests: `pytest`
+---
 
-## Style / Safety Rules
-- Do not expose keys in frontend or commits.
-- Do not add trackers.
+## Guardrails for Codex
+**Codex must follow TASKS.md strictly.**
+
+Allowed scope right now:
+- P0-A OCR stabilization + tests
+- P0-B unified hub merge + paywall scaffolding
+- reliability refactors (timeouts, retries, fallback)
+- UI polish only in service of P0
+
+Not allowed yet:
+- P1 mobile apps
+- deep agents beyond scaffolding mentioned in P0
+- marketing agents suite
+- new heavy dependencies without explicit instruction
+
+---
+
+## Style Rules
+- No secrets in frontend.
 - Keep EN/ES autodetect + manual toggle.
-- Preserve Dockerfile + requirements completeness.
-- Add retry, timeout, fallback handling for every external call.
-
-## What Codex should prioritize
-Follow TASKS.md strictly. Do not start P1 until P0 is complete and stable.
+- Use small, typed functions (Pydantic v2).
+- Tenacity retries for all external calls.
+- Add tests when fixing bugs.
