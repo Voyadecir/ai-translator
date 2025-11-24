@@ -19,6 +19,8 @@ CONFIDENCE_THRESHOLD: float = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.75"
 DEBUG_SAVE: bool = get_env_bool("OCR_DEBUG_SAVE", False)
 DEBUG_DIR: str = os.getenv("OCR_DEBUG_DIR", "/tmp/ocr_debug")
 AZURE_DI_POLL_ATTEMPTS: int = int(os.getenv("AZURE_DI_POLL_ATTEMPTS", "10"))
-AZURE_DI_INITIAL_POLL_WAIT: float = float(os.getenv("AZURE_DI_INITIAL_POLL_WAIT", "0.5"))
+AZURE_DI_INITIAL_POLL_WAIT: float = float(
+    os.getenv("AZURE_DI_INITIAL_POLL_WAIT", "0.5")
+)
 AZURE_DI_MAX_POLL_WAIT: float = float(os.getenv("AZURE_DI_MAX_POLL_WAIT", "4.0"))
 AZURE_DI_POLL_BACKOFF: float = float(os.getenv("AZURE_DI_POLL_BACKOFF", "1.5"))

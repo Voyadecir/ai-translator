@@ -4,7 +4,12 @@ import os
 from dataclasses import dataclass
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 
 # -----------------------------
@@ -18,6 +23,7 @@ class TranslationConfig:
 
 class TransientHTTPError(Exception):
     """Network/provider hiccup that is worth retrying."""
+
     pass
 
 
@@ -41,12 +47,12 @@ async def _openai_translate(text: str, target_lang: str, timeout: float) -> str:
         "messages": [
             {
                 "role": "system",
-                "content": "You are a professional translator. Keep meaning, tone, and formatting. Output only the translated text."
+                "content": (
+                    "You are a professional translator. Keep meaning, tone, and "
+                    "formatting. Output only the translated text."
+                ),
             },
-            {
-                "role": "user",
-                "content": f"Translate to {target_lang}:\n\n{text}"
-            },
+            {"role": "user", "content": f"Translate to {target_lang}:\n\n{text}"},
         ],
         "temperature": 0.2,
     }
@@ -61,12 +67,7 @@ async def _openai_translate(text: str, target_lang: str, timeout: float) -> str:
             raise RuntimeError(f"OpenAI {resp.status_code}: {resp.text}")
 
         data = resp.json()
-        out = (
-            data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-        )
+        out = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         if not out:
             raise RuntimeError("Empty translation from provider")
         return out
@@ -77,7 +78,9 @@ async def _openai_translate(text: str, target_lang: str, timeout: float) -> str:
 # -----------------------------
 @retry(
     stop=stop_after_attempt(int(os.getenv("MAX_RETRIES", "2"))),
-    wait=wait_exponential(multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "0.8")), max=6),
+    wait=wait_exponential(
+        multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "0.8")), max=6
+    ),
     retry=retry_if_exception_type(TransientHTTPError),
     reraise=True,
 )
@@ -97,6 +100,8 @@ async def translate_text(text: str, target_lang: str) -> str:
         return f"[{target_lang}] {text}"
 
     if os.getenv("OPENAI_API_KEY"):
-        return await _openai_translate(text, target_lang, timeout=float(os.getenv("HTTP_TIMEOUT_SECONDS", "15")))
+        return await _openai_translate(
+            text, target_lang, timeout=float(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
+        )
 
     return f"[{target_lang}] {text}"

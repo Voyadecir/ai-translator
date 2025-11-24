@@ -36,15 +36,26 @@ async def ocr_debug(file: UploadFile = File(...)):
             "magic": raw_bytes[:12].hex(),
         }
     except StageError as exc:
-        return JSONResponse(status_code=400, content=build_stage_error_response(exc.stage, exc.message, stages))
+        return JSONResponse(
+            status_code=400,
+            content=build_stage_error_response(exc.stage, exc.message, stages),
+        )
     except Exception as exc:  # pragma: no cover - defensive
-        return JSONResponse(status_code=400, content=build_stage_error_response("upload_parse", str(exc), stages))
+        return JSONResponse(
+            status_code=400,
+            content=build_stage_error_response("upload_parse", str(exc), stages),
+        )
 
     try:
-        preprocessed, preprocess_meta, render_format = preprocess_bytes(raw_bytes, content_type)
+        preprocessed, preprocess_meta, render_format = preprocess_bytes(
+            raw_bytes, content_type
+        )
         stages.update(preprocess_meta)
     except StageError as exc:
-        return JSONResponse(status_code=400, content=build_stage_error_response(exc.stage, exc.message, stages))
+        return JSONResponse(
+            status_code=400,
+            content=build_stage_error_response(exc.stage, exc.message, stages),
+        )
 
     payload_bytes, payload_type = _prepare_payload(preprocessed, render_format)
 
@@ -72,9 +83,17 @@ async def ocr_debug(file: UploadFile = File(...)):
             try:
                 final_result = run_tesseract(preprocessed)
             except StageError as exc:
-                return JSONResponse(status_code=500, content=build_stage_error_response(exc.stage, exc.message, stages))
+                return JSONResponse(
+                    status_code=500,
+                    content=build_stage_error_response(exc.stage, exc.message, stages),
+                )
             except Exception as exc:  # pragma: no cover - defensive
-                return JSONResponse(status_code=500, content=build_stage_error_response("fallback_call", str(exc), stages))
+                return JSONResponse(
+                    status_code=500,
+                    content=build_stage_error_response(
+                        "fallback_call", str(exc), stages
+                    ),
+                )
             stages["fallback_call"] = "ok"
 
         text_preview = (final_result.text or "").strip().replace("\n", " ")
@@ -90,7 +109,10 @@ async def ocr_debug(file: UploadFile = File(...)):
         }
         return JSONResponse(status_code=200, content=response_body)
     except Exception as exc:  # pragma: no cover - defensive
-        return JSONResponse(status_code=500, content=build_stage_error_response("unexpected", str(exc), stages))
+        return JSONResponse(
+            status_code=500,
+            content=build_stage_error_response("unexpected", str(exc), stages),
+        )
 
 
 def _prepare_payload(preprocessed, render_format: str):

@@ -8,9 +8,15 @@ import cv2
 import httpx
 import numpy as np
 import pytesseract
-from PIL import Image, ImageFilter
 from pdf2image import convert_from_bytes
-from tenacity import AsyncRetrying, RetryError, retry_if_exception_type, stop_after_attempt, wait_exponential
+from PIL import Image, ImageFilter
+from tenacity import (
+    AsyncRetrying,
+    RetryError,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from . import config
 
@@ -76,15 +82,21 @@ def _deskew(gray: np.ndarray) -> np.ndarray:
     (h, w) = gray.shape
     center = (w // 2, h // 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return cv2.warpAffine(
+        gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
 
 
 def _preprocess_image(image: Image.Image, idx: int) -> Image.Image:
     np_img = np.array(image)
     gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
     gray = _deskew(gray)
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
-    denoised = cv2.fastNlMeansDenoising(thresh, h=15, templateWindowSize=7, searchWindowSize=21)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
+    )
+    denoised = cv2.fastNlMeansDenoising(
+        thresh, h=15, templateWindowSize=7, searchWindowSize=21
+    )
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     sharpened = cv2.filter2D(denoised, -1, kernel)
     processed = Image.fromarray(sharpened).filter(ImageFilter.MedianFilter(size=3))
@@ -92,7 +104,9 @@ def _preprocess_image(image: Image.Image, idx: int) -> Image.Image:
     return processed
 
 
-def preprocess_bytes(file_bytes: bytes, content_type: str) -> Tuple[List[Image.Image], Dict[str, object], str]:
+def preprocess_bytes(
+    file_bytes: bytes, content_type: str
+) -> Tuple[List[Image.Image], Dict[str, object], str]:
     stages_meta: Dict[str, object] = {}
     if content_type == "application/pdf" or file_bytes.startswith(b"%PDF"):
         images = _convert_pdf_to_images(file_bytes)
@@ -103,12 +117,22 @@ def preprocess_bytes(file_bytes: bytes, content_type: str) -> Tuple[List[Image.I
     for idx, img in enumerate(images, start=1):
         preprocessed.append(_preprocess_image(img, idx))
     stages_meta["preprocess"] = "ok"
-    stages_meta["preprocess_steps"] = ["grayscale", "deskew", "adaptive_threshold", "denoise", "sharpen"]
-    render_format = "PDF" if len(preprocessed) > 1 or content_type == "application/pdf" else "PNG"
+    stages_meta["preprocess_steps"] = [
+        "grayscale",
+        "deskew",
+        "adaptive_threshold",
+        "denoise",
+        "sharpen",
+    ]
+    render_format = (
+        "PDF" if len(preprocessed) > 1 or content_type == "application/pdf" else "PNG"
+    )
     return preprocessed, stages_meta, render_format
 
 
-def _images_to_bytes(images: List[Image.Image], render_format: str) -> Tuple[bytes, str]:
+def _images_to_bytes(
+    images: List[Image.Image], render_format: str
+) -> Tuple[bytes, str]:
     buffer = BytesIO()
     if render_format.upper() == "PDF":
         images[0].save(buffer, format="PDF", save_all=True, append_images=images[1:])
@@ -120,7 +144,11 @@ def _images_to_bytes(images: List[Image.Image], render_format: str) -> Tuple[byt
 
 
 async def _post_with_retry(
-    client: httpx.AsyncClient, url: str, headers: Dict[str, str], data: bytes, params: Optional[Dict[str, str]] = None
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Dict[str, str],
+    data: bytes,
+    params: Optional[Dict[str, str]] = None,
 ) -> httpx.Response:
     async for attempt in AsyncRetrying(
         reraise=True,
@@ -129,13 +157,17 @@ async def _post_with_retry(
         retry=retry_if_exception_type(httpx.HTTPError),
     ):
         with attempt:
-            response = await client.post(url, headers=headers, content=data, params=params)
+            response = await client.post(
+                url, headers=headers, content=data, params=params
+            )
             response.raise_for_status()
             return response
     raise RuntimeError("Unreachable retry block")
 
 
-async def call_azure_read(file_bytes: bytes, content_type: str, stages: Dict[str, object]) -> OcrResult:
+async def call_azure_read(
+    file_bytes: bytes, content_type: str, stages: Dict[str, object]
+) -> OcrResult:
     if config.OFFLINE_MODE:
         raise StageError("azure_read_call", "Offline mode enabled")
     required_fields = {
@@ -146,13 +178,21 @@ async def call_azure_read(file_bytes: bytes, content_type: str, stages: Dict[str
     }
     missing = [name for name, value in required_fields.items() if not value]
     if missing:
+        missing_msg = ", ".join(sorted(missing))
         raise StageError(
             "azure_read_call",
-            f"Missing Azure Document Intelligence configuration: {', '.join(sorted(missing))}",
+            f"Missing Azure Document Intelligence configuration: {missing_msg}",
         )
 
     base_endpoint = config.AZURE_DI_ENDPOINT.rstrip("/")
-    analyze_url = f"{base_endpoint}/documentintelligence/documentModels/{config.AZURE_DI_MODEL}:analyze"
+    analyze_url = "/".join(
+        [
+            base_endpoint,
+            "documentintelligence",
+            "documentModels",
+            f"{config.AZURE_DI_MODEL}:analyze",
+        ]
+    )
     params = {"api-version": config.AZURE_DI_API_VERSION}
     headers = {
         "Ocp-Apim-Subscription-Key": config.AZURE_DI_API_KEY,
@@ -166,28 +206,46 @@ async def call_azure_read(file_bytes: bytes, content_type: str, stages: Dict[str
         "model": config.AZURE_DI_MODEL,
     }
 
-    async with httpx.AsyncClient(timeout=config.HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=config.HTTP_TIMEOUT_SECONDS, follow_redirects=True
+    ) as client:
         try:
-            analyze_response = await _post_with_retry(client, analyze_url, headers, file_bytes, params=params)
+            analyze_response = await _post_with_retry(
+                client, analyze_url, headers, file_bytes, params=params
+            )
         except RetryError as exc:
             reason = str(exc.last_attempt.exception()) if exc.last_attempt else str(exc)
-            raise StageError("azure_read_call", f"Azure analyze failed after retries: {reason}")
+            raise StageError(
+                "azure_read_call", f"Azure analyze failed after retries: {reason}"
+            )
         except httpx.HTTPError as exc:
             raise StageError("azure_read_call", f"Azure analyze failed: {exc}")
 
-        operation_url = analyze_response.headers.get("operation-location") or analyze_response.headers.get("Operation-Location")
+        operation_url = analyze_response.headers.get(
+            "operation-location"
+        ) or analyze_response.headers.get("Operation-Location")
         if not operation_url:
-            raise StageError("azure_read_call", "Missing Operation-Location header from Azure response")
+            raise StageError(
+                "azure_read_call",
+                "Missing Operation-Location header from Azure response",
+            )
 
-        poll_headers = {"Ocp-Apim-Subscription-Key": config.AZURE_DI_API_KEY, "Accept": "application/json"}
+        poll_headers = {
+            "Ocp-Apim-Subscription-Key": config.AZURE_DI_API_KEY,
+            "Accept": "application/json",
+        }
         delay = config.AZURE_DI_INITIAL_POLL_WAIT
         for attempt in range(1, config.AZURE_DI_POLL_ATTEMPTS + 1):
             await asyncio.sleep(delay)
             try:
-                poll = await client.get(operation_url, headers=poll_headers, params=params)
+                poll = await client.get(
+                    operation_url, headers=poll_headers, params=params
+                )
                 poll.raise_for_status()
             except httpx.HTTPError as exc:
-                raise StageError("azure_read_call", f"Azure poll failed on attempt {attempt}: {exc}")
+                raise StageError(
+                    "azure_read_call", f"Azure poll failed on attempt {attempt}: {exc}"
+                )
 
             payload = poll.json()
             status = (payload.get("status") or "").lower()
@@ -201,16 +259,23 @@ async def call_azure_read(file_bytes: bytes, content_type: str, stages: Dict[str
                     "poll_attempts": attempt,
                     "api_version": config.AZURE_DI_API_VERSION,
                 }
-                return OcrResult(text=text, confidence=confidence, engine_used="azure_primary")
+                return OcrResult(
+                    text=text, confidence=confidence, engine_used="azure_primary"
+                )
             if status in {"failed", "canceled"}:
                 message = _extract_azure_error(payload)
                 raise StageError("azure_read_call", f"Azure OCR {status}: {message}")
 
-            delay = min(delay * config.AZURE_DI_POLL_BACKOFF, config.AZURE_DI_MAX_POLL_WAIT)
+            delay = min(
+                delay * config.AZURE_DI_POLL_BACKOFF, config.AZURE_DI_MAX_POLL_WAIT
+            )
 
         raise StageError(
             "azure_read_call",
-            f"Azure OCR timed out while polling ({config.AZURE_DI_POLL_ATTEMPTS} attempts)",
+            (
+                "Azure OCR timed out while polling "
+                f"({config.AZURE_DI_POLL_ATTEMPTS} attempts)"
+            ),
         )
 
 
@@ -218,16 +283,28 @@ def _extract_azure_error(payload: Dict[str, object]) -> str:
     error = payload.get("error") if isinstance(payload, dict) else None
     if isinstance(error, dict):
         message = error.get("message") or error.get("code")
-        inner = error.get("innererror") if isinstance(error.get("innererror"), dict) else None
+        inner = (
+            error.get("innererror")
+            if isinstance(error.get("innererror"), dict)
+            else None
+        )
         if inner and inner.get("message"):
-            return f"{message}: {inner.get('message')}" if message else str(inner.get("message"))
+            return (
+                f"{message}: {inner.get('message')}"
+                if message
+                else str(inner.get("message"))
+            )
         if message:
             return str(message)
     analyze_result = payload.get("analyzeResult") if isinstance(payload, dict) else None
     if isinstance(analyze_result, dict):
         errors = analyze_result.get("errors")
         if isinstance(errors, list) and errors:
-            messages = [err.get("message") for err in errors if isinstance(err, dict) and err.get("message")]
+            messages = [
+                err.get("message")
+                for err in errors
+                if isinstance(err, dict) and err.get("message")
+            ]
             if messages:
                 return "; ".join(messages)
     return "Unknown error"
@@ -250,15 +327,21 @@ def run_tesseract(images: List[Image.Image]) -> OcrResult:
     texts: List[str] = []
     for img in images:
         try:
-            text = pytesseract.image_to_string(img, lang="eng+spa", config="--oem 3 --psm 6")
-        except pytesseract.TesseractError as exc:  # pragma: no cover - depends on system binary
+            text = pytesseract.image_to_string(
+                img, lang="eng+spa", config="--oem 3 --psm 6"
+            )
+        except (
+            pytesseract.TesseractError
+        ) as exc:  # pragma: no cover - depends on system binary
             raise StageError("fallback_call", f"Tesseract failed: {exc}")
         texts.append(text)
     combined = "\n".join(texts)
     return OcrResult(text=combined, confidence=0.5, engine_used="fallback")
 
 
-def build_stage_error_response(stage: str, message: str, stages: Dict[str, object]) -> Dict[str, object]:
+def build_stage_error_response(
+    stage: str, message: str, stages: Dict[str, object]
+) -> Dict[str, object]:
     stages[stage] = {"status": "error", "reason": message}
     return {
         "engine_used": None,
