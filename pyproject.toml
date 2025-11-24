@@ -7,34 +7,30 @@ name = "ai-translator"
 version = "0.1.0"
 description = "AI-powered PDF and text translator with OCR and FastAPI interface."
 authors = [
-    { name = "Luis Parra", email = "your_email@example.com" }
+  { name = "Voyadecir", email = "admin.voyadecir@proton.me" }
 ]
-readme = "README.md"
+readme = "README_DEPLOY.md"
 requires-python = ">=3.11"
 
-# ---- Dependencies ----
+# ---- Runtime Dependencies ----
 dependencies = [
-    "fastapi",
-    "uvicorn",
-    "pydantic",
-    "python-dotenv",
-    "requests",
-    "pillow",
-    "python-multipart",
-    "rich",
-    "tenacity",
-    "pytest",
-    "pytest-cov",
-    "black",
-    "ruff",
+  "fastapi",
+  "uvicorn",
+  "pydantic",
+  "python-dotenv",
+  "requests",
+  "pillow",
+  "python-multipart",
+  "rich",
+  "tenacity",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "pytest-cov",
-    "black",
-    "ruff",
+  "pytest",
+  "pytest-cov",
+  "black",
+  "ruff",
 ]
 
 [tool.setuptools.packages.find]
@@ -42,14 +38,17 @@ where = ["src/python"]
 include = ["ai_translator*"]
 
 [tool.black]
-line-length = 88
+line-length = 100
 target-version = ["py311"]
 
 [tool.ruff]
-line-length = 88
+line-length = 100
 fix = true
-select = ["E", "F", "I"]
 exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
 
 [tool.pytest.ini_options]
 addopts = "--disable-warnings"
