@@ -138,10 +138,21 @@ async def _post_with_retry(
 async def call_azure_read(file_bytes: bytes, content_type: str, stages: Dict[str, object]) -> OcrResult:
     if config.OFFLINE_MODE:
         raise StageError("azure_read_call", "Offline mode enabled")
-    if not (config.AZURE_DI_ENDPOINT and config.AZURE_DI_API_KEY):
-        raise StageError("azure_read_call", "Missing Azure Document Intelligence configuration")
+    required_fields = {
+        "AZURE_DI_ENDPOINT": config.AZURE_DI_ENDPOINT,
+        "AZURE_DI_API_KEY": config.AZURE_DI_API_KEY,
+        "AZURE_DI_API_VERSION": config.AZURE_DI_API_VERSION,
+        "AZURE_DI_MODEL": config.AZURE_DI_MODEL,
+    }
+    missing = [name for name, value in required_fields.items() if not value]
+    if missing:
+        raise StageError(
+            "azure_read_call",
+            f"Missing Azure Document Intelligence configuration: {', '.join(sorted(missing))}",
+        )
 
-    analyze_url = f"{config.AZURE_DI_ENDPOINT}/documentintelligence/documentModels/{config.AZURE_DI_MODEL}:analyze"
+    base_endpoint = config.AZURE_DI_ENDPOINT.rstrip("/")
+    analyze_url = f"{base_endpoint}/documentintelligence/documentModels/{config.AZURE_DI_MODEL}:analyze"
     params = {"api-version": config.AZURE_DI_API_VERSION}
     headers = {
         "Ocp-Apim-Subscription-Key": config.AZURE_DI_API_KEY,
@@ -149,11 +160,18 @@ async def call_azure_read(file_bytes: bytes, content_type: str, stages: Dict[str
         "Accept": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=config.HTTP_TIMEOUT_SECONDS) as client:
+    stages["azure_read_call"] = {
+        "status": "calling",
+        "endpoint": base_endpoint,
+        "model": config.AZURE_DI_MODEL,
+    }
+
+    async with httpx.AsyncClient(timeout=config.HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
         try:
             analyze_response = await _post_with_retry(client, analyze_url, headers, file_bytes, params=params)
         except RetryError as exc:
-            raise StageError("azure_read_call", f"Azure analyze failed after retries: {exc}")
+            reason = str(exc.last_attempt.exception()) if exc.last_attempt else str(exc)
+            raise StageError("azure_read_call", f"Azure analyze failed after retries: {reason}")
         except httpx.HTTPError as exc:
             raise StageError("azure_read_call", f"Azure analyze failed: {exc}")
 
@@ -161,25 +179,58 @@ async def call_azure_read(file_bytes: bytes, content_type: str, stages: Dict[str
         if not operation_url:
             raise StageError("azure_read_call", "Missing Operation-Location header from Azure response")
 
-        for attempt in range(10):
-            await asyncio.sleep(min(1 + attempt * 0.5, 4))
-            poll = await client.get(
-                operation_url,
-                headers={"Ocp-Apim-Subscription-Key": config.AZURE_DI_API_KEY, "Accept": "application/json"},
-                params=params,
-            )
-            poll.raise_for_status()
+        poll_headers = {"Ocp-Apim-Subscription-Key": config.AZURE_DI_API_KEY, "Accept": "application/json"}
+        delay = config.AZURE_DI_INITIAL_POLL_WAIT
+        for attempt in range(1, config.AZURE_DI_POLL_ATTEMPTS + 1):
+            await asyncio.sleep(delay)
+            try:
+                poll = await client.get(operation_url, headers=poll_headers, params=params)
+                poll.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise StageError("azure_read_call", f"Azure poll failed on attempt {attempt}: {exc}")
+
             payload = poll.json()
-            status = payload.get("status")
+            status = (payload.get("status") or "").lower()
             if status == "succeeded":
                 analyze_result = payload.get("analyzeResult", {})
                 text = analyze_result.get("content", "")
                 confidence = _compute_confidence(analyze_result)
-                stages["azure_read_call"] = "ok"
+                stages["azure_read_call"] = {
+                    "status": "ok",
+                    "operation_url": operation_url,
+                    "poll_attempts": attempt,
+                    "api_version": config.AZURE_DI_API_VERSION,
+                }
                 return OcrResult(text=text, confidence=confidence, engine_used="azure_primary")
             if status in {"failed", "canceled"}:
-                raise StageError("azure_read_call", f"Azure OCR {status}")
-        raise StageError("azure_read_call", "Azure OCR timed out while polling")
+                message = _extract_azure_error(payload)
+                raise StageError("azure_read_call", f"Azure OCR {status}: {message}")
+
+            delay = min(delay * config.AZURE_DI_POLL_BACKOFF, config.AZURE_DI_MAX_POLL_WAIT)
+
+        raise StageError(
+            "azure_read_call",
+            f"Azure OCR timed out while polling ({config.AZURE_DI_POLL_ATTEMPTS} attempts)",
+        )
+
+
+def _extract_azure_error(payload: Dict[str, object]) -> str:
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("code")
+        inner = error.get("innererror") if isinstance(error.get("innererror"), dict) else None
+        if inner and inner.get("message"):
+            return f"{message}: {inner.get('message')}" if message else str(inner.get("message"))
+        if message:
+            return str(message)
+    analyze_result = payload.get("analyzeResult") if isinstance(payload, dict) else None
+    if isinstance(analyze_result, dict):
+        errors = analyze_result.get("errors")
+        if isinstance(errors, list) and errors:
+            messages = [err.get("message") for err in errors if isinstance(err, dict) and err.get("message")]
+            if messages:
+                return "; ".join(messages)
+    return "Unknown error"
 
 
 def _compute_confidence(analyze_result: Dict[str, object]) -> float:

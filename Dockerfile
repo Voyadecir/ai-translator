@@ -1,12 +1,14 @@
 FROM python:3.11-slim
 
-RUN apt-get update \ 
+RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         tesseract-ocr-eng \
         tesseract-ocr-spa \
         poppler-utils \
-        imagemagick \ 
+        imagemagick \
+        libglib2.0-0 \
+        libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
