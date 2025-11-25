@@ -2,7 +2,7 @@ import logging
 from io import BytesIO
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -13,15 +13,18 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Voyadecir OCR Backend")
 
+# Ruff B008-friendly: call File() once at module level
+FILE_NONE = File(default=None)
+
 
 async def _coerce_upload_file(
     request: Request,
     file: Optional[UploadFile],
 ) -> UploadFile:
     """
-    Accept either a multipart UploadFile (FormData) or a raw body upload.
-    If multipart file exists, use it.
-    Otherwise, read raw bytes from request.body() and wrap as UploadFile.
+    Accept either:
+      1) multipart UploadFile (FormData field "file")
+      2) raw body upload (Content-Type: application/pdf, image/*, etc)
     """
     if file is not None:
         return file
@@ -30,7 +33,7 @@ async def _coerce_upload_file(
     if not raw_bytes:
         raise HTTPException(
             status_code=400,
-            detail="No file provided. Send as FormData field 'file' or raw body.",
+            detail="No file provided. Send FormData field 'file' or raw body.",
         )
 
     content_type = request.headers.get(
@@ -74,7 +77,7 @@ async def mailbills_parse_alive() -> JSONResponse:
 @app.post("/api/mailbills/parse")
 async def mailbills_parse(
     request: Request,
-    file: Optional[UploadFile] = File(default=None),
+    file: Optional[UploadFile] = FILE_NONE,
     target_lang: str = Query(default="en"),
 ) -> JSONResponse:
     upload = await _coerce_upload_file(request, file)
@@ -98,7 +101,7 @@ async def ocr_debug_alive() -> JSONResponse:
 @app.post("/api/ocr-debug")
 async def ocr_debug(
     request: Request,
-    file: Optional[UploadFile] = File(default=None),
+    file: Optional[UploadFile] = FILE_NONE,
     target_lang: str = Query(default="en"),
 ) -> JSONResponse:
     upload = await _coerce_upload_file(request, file)
