@@ -78,9 +78,7 @@ async def _openai_translate(text: str, target_lang: str, timeout: float) -> str:
 # -----------------------------
 @retry(
     stop=stop_after_attempt(int(os.getenv("MAX_RETRIES", "2"))),
-    wait=wait_exponential(
-        multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "0.8")), max=6
-    ),
+    wait=wait_exponential(multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "0.8")), max=6),
     retry=retry_if_exception_type(TransientHTTPError),
     reraise=True,
 )
