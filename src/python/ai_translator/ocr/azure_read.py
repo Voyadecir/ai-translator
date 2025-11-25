@@ -3,7 +3,13 @@ import logging
 from typing import Dict, List, Optional
 
 import httpx
-from tenacity import AsyncRetrying, RetryError, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    RetryError,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from ai_translator import config
 from ai_translator.ocr.types import OcrResult, StageError
@@ -58,9 +64,7 @@ def _extract_azure_error(payload: Dict[str, object]) -> str:
         errors = analyze_result.get("errors")
         if isinstance(errors, list) and errors:
             messages = [
-                err.get("message")
-                for err in errors
-                if isinstance(err, dict) and err.get("message")
+                err.get("message") for err in errors if isinstance(err, dict) and err.get("message")
             ]
             if messages:
                 return "; ".join(messages)
@@ -80,7 +84,8 @@ async def azure_read(file_bytes: bytes, content_type: str, stages: Dict[str, obj
     missing = [name for name, value in required_fields.items() if not value]
     if missing:
         raise StageError(
-            "azure_call", f"Missing Azure Document Intelligence configuration: {', '.join(sorted(missing))}"
+            "azure_call",
+            f"Missing Azure Document Intelligence configuration: {', '.join(sorted(missing))}",
         )
 
     base_endpoint = config.AZURE_DI_ENDPOINT.rstrip("/")
@@ -105,18 +110,22 @@ async def azure_read(file_bytes: bytes, content_type: str, stages: Dict[str, obj
         "model": config.AZURE_DI_MODEL,
     }
 
-    async with httpx.AsyncClient(timeout=config.HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=config.HTTP_TIMEOUT_SECONDS, follow_redirects=True
+    ) as client:
         try:
-            analyze_response = await _post_with_retry(client, analyze_url, headers, file_bytes, params=params)
+            analyze_response = await _post_with_retry(
+                client, analyze_url, headers, file_bytes, params=params
+            )
         except RetryError as exc:
             reason = str(exc.last_attempt.exception()) if exc.last_attempt else str(exc)
             raise StageError("azure_call", f"Azure analyze failed after retries: {reason}")
         except httpx.HTTPError as exc:
             raise StageError("azure_call", f"Azure analyze failed: {exc}")
 
-        operation_url = analyze_response.headers.get("operation-location") or analyze_response.headers.get(
-            "Operation-Location"
-        )
+        operation_url = analyze_response.headers.get(
+            "operation-location"
+        ) or analyze_response.headers.get("Operation-Location")
         if not operation_url:
             raise StageError("azure_call", "Missing Operation-Location header from Azure response")
 
@@ -154,5 +163,6 @@ async def azure_read(file_bytes: bytes, content_type: str, stages: Dict[str, obj
             delay = min(delay * config.AZURE_DI_POLL_BACKOFF, config.AZURE_DI_MAX_POLL_WAIT)
 
         raise StageError(
-            "azure_call", f"Azure OCR timed out while polling ({config.AZURE_DI_POLL_ATTEMPTS} attempts)"
+            "azure_call",
+            f"Azure OCR timed out while polling ({config.AZURE_DI_POLL_ATTEMPTS} attempts)",
         )
