@@ -16,7 +16,9 @@ class StageError(Exception):
         self.message = message
 
 
-def build_stage_error_response(stage: str, message: str, stages: Dict[str, object]) -> Dict[str, object]:
+def build_stage_error_response(
+    stage: str, message: str, stages: Dict[str, object]
+) -> Dict[str, object]:
     stages[stage] = {"status": "error", "reason": message}
     return {
         "engine_used": None,

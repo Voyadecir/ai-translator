@@ -79,7 +79,9 @@ def _preprocess_image(image: Image.Image, idx: int) -> Image.Image:
     return processed
 
 
-def preprocess_bytes(file_bytes: bytes, content_type: str) -> Tuple[List[Image.Image], Dict[str, object], str]:
+def preprocess_bytes(
+    file_bytes: bytes, content_type: str
+) -> Tuple[List[Image.Image], Dict[str, object], str]:
     stages_meta: Dict[str, object] = {}
     if content_type == "application/pdf" or file_bytes.startswith(b"%PDF"):
         images = _convert_pdf_to_images(file_bytes)

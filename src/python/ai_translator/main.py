@@ -68,9 +68,7 @@ class TranslateError(Exception):
 # ---------- Resilient wrappers ----------
 @retry(
     stop=stop_after_attempt(int(os.getenv("MAX_RETRIES", "3"))),
-    wait=wait_exponential(
-        multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "1")), max=10
-    ),
+    wait=wait_exponential(multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "1")), max=10),
     retry=retry_if_exception_type(PdfConvertError),
     reraise=True,
 )
@@ -84,9 +82,7 @@ def safe_pdf_to_pngs(pdf_path: Path, out_dir: Path, pdftoppm: str):
 
 @retry(
     stop=stop_after_attempt(int(os.getenv("MAX_RETRIES", "3"))),
-    wait=wait_exponential(
-        multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "1")), max=10
-    ),
+    wait=wait_exponential(multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "1")), max=10),
     retry=retry_if_exception_type(OcrError),
     reraise=True,
 )
@@ -106,8 +102,7 @@ def dump_dashboard():
         "ocr_cb": ocr_cb.state,
         "translate_cb": translate_cb.state,
         "offline_mode_used": (
-            os.getenv("OFFLINE_MODE", "false").lower() == "true"
-            or not os.getenv("OPENAI_API_KEY")
+            os.getenv("OFFLINE_MODE", "false").lower() == "true" or not os.getenv("OPENAI_API_KEY")
         ),
         "last_run_at": time.time(),
     }
@@ -172,9 +167,7 @@ def main():
             else:
                 try:
                     for img in imgs:
-                        txt = safe_ocr_image(
-                            img, h.tesseract_path, os.getenv("OCR_LANG", "eng")
-                        )
+                        txt = safe_ocr_image(img, h.tesseract_path, os.getenv("OCR_LANG", "eng"))
                         ocr_text_all += txt + "\n"
                     ocr_cb.record_success()
                 except Exception as e:
