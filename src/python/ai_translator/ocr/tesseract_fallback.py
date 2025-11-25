@@ -22,8 +22,8 @@ def tesseract_ocr(images: List[Image.Image]) -> OcrResult:
                 config="--oem 3 --psm 6",
             )
         except (
-            pytesseract.TesseractError
-        ) as exc:  # pragma: no cover - depends on system binary
+            pytesseract.TesseractError  # pragma: no cover - depends on system binary
+        ) as exc:
             raise StageError("fallback_call", f"Tesseract failed: {exc}")
         texts.append(text)
 
