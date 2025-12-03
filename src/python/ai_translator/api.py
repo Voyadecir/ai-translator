@@ -1,200 +1,147 @@
-import os
 import logging
-from typing import List, Optional, Dict, Any
+from io import BytesIO
+from typing import Optional
 
-import httpx
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
+from fastapi.responses import JSONResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from .ocr import run_ocr_pipeline
+
+# Try to bring in the deep-agent router, but don't let it kill the app if it fails.
+try:
+    from .mailbills_agent import router as mailbills_router
+except Exception as exc:  # noqa: BLE001
+    mailbills_router = None  # type: ignore[assignment]
+    logging.getLogger(__name__).error(
+        "Failed to import mailbills_agent.router: %s", exc
+    )
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/mailbills/interpret", tags=["mailbills"])
+# ✅ This is the ASGI app uvicorn looks for: ai_translator.api:app
+app = FastAPI(title="Voyadecir Backend")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OFFLINE_MODE = os.getenv("OFFLINE_MODE", "false").lower() == "true"
+# ✅ Mount deep-agent routes under /api if available
+if mailbills_router is not None:
+    app.include_router(mailbills_router, prefix="/api")
 
-
-class MailBillsInterpretRequest(BaseModel):
-    ocr_text: str = Field(..., description="Raw OCR text from the bill or mail")
-    source_lang: str = Field("en", description="Language of the OCR text, e.g. 'en' or 'es'")
-    target_lang: str = Field("es", description="Target language for the explanation/summary")
-    country: Optional[str] = Field(
-        default="US",
-        description="Country context for bill formats, e.g. 'US', 'MX', etc.",
-    )
-    bill_type: Optional[str] = Field(
-        default=None,
-        description="Optional hint: 'electric', 'water', 'phone', 'generic', etc.",
-    )
+# Ruff B008-friendly: call File() once at module level
+FILE_NONE = File(default=None)
 
 
-class FieldValue(BaseModel):
-    value: str = ""
-    confidence: float = 0.0
-
-
-class MailBillsInterpretResponse(BaseModel):
-    ok: bool = True
-    summary_en: str = ""
-    summary_translated: str = ""
-    fields: Dict[str, FieldValue] = Field(
-        default_factory=dict,
-        description="Key fields extracted from the document (amount_due, due_date, etc.)",
-    )
-    reasoning: Optional[str] = Field(
-        default=None,
-        description="Optional explanation of how the model interpreted the document.",
-    )
-    error: Optional[str] = None
-
-
-async def _call_openai_agent(prompt: str) -> Dict[str, Any]:
+async def _coerce_upload_file(
+    request: Request,
+    file: Optional[UploadFile],
+) -> UploadFile:
     """
-    Low-level call to OpenAI Chat Completions.
-    We use httpx directly so we don't depend on the openai SDK.
+    Accept either:
+      1) multipart UploadFile (FormData field "file")
+      2) raw body upload (Content-Type: application/pdf, image/*, etc)
     """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
+    if file is not None:
+        return file
 
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # We ask the model to return STRICT JSON, no extra commentary.
-    body = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant that extracts key fields from utility bills "
-                    "and postal mail and explains them clearly to non-native speakers. "
-                    "Always respond with STRICT JSON that matches the requested schema, "
-                    "with no extra text."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
-        data = resp.json()
-
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Unexpected OpenAI response: %s", data)
-        raise RuntimeError(f"Unexpected OpenAI response structure: {exc}") from exc
-
-    try:
-        parsed = json.loads(content)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to parse model JSON: %s", content)
-        raise RuntimeError(f"Model did not return valid JSON: {exc}") from exc
-
-    return parsed
-
-
-def _build_prompt(payload: MailBillsInterpretRequest) -> str:
-    """
-    Build a clear prompt telling the model EXACTLY which JSON keys to return.
-    """
-    # We fix the expected JSON schema explicitly:
-    schema_hint = """
-Return a JSON object with this exact structure:
-
-{
-  "summary_en": "string, short friendly explanation of the bill in English",
-  "summary_translated": "string, same explanation in the target language",
-  "fields": {
-    "amount_due":   {"value": "string", "confidence": 0.0},
-    "due_date":     {"value": "string", "confidence": 0.0},
-    "account_number": {"value": "string", "confidence": 0.0},
-    "sender":       {"value": "string", "confidence": 0.0},
-    "service_address": {"value": "string", "confidence": 0.0}
-  },
-  "reasoning": "optional: short explanation of how you found the fields"
-}
-
-- 'confidence' should be a number between 0 and 1.
-- If you are not sure about a field, leave value as an empty string and confidence near 0.
-"""
-
-    bill_context = f"Country: {payload.country or 'unknown'}, bill_type: {payload.bill_type or 'unknown'}."
-    lang_context = (
-        f"The OCR text appears to be in '{payload.source_lang}'. "
-        f"The user wants explanations in target_lang='{payload.target_lang}'."
-    )
-
-    return (
-        f"{schema_hint}\n\n"
-        f"{bill_context}\n{lang_context}\n\n"
-        "Here is the OCR text from the bill or mail:\n\n"
-        f"{payload.ocr_text}"
-    )
-
-
-import json  # keep import here so we don't forget it at the top
-
-
-@router.post("/interpret", response_model=MailBillsInterpretResponse)
-async def interpret_mailbills(payload: MailBillsInterpretRequest) -> MailBillsInterpretResponse:
-    """
-    Deep agent endpoint:
-    - Takes OCR text + context
-    - Calls OpenAI
-    - Returns structured fields + summaries
-    """
-    if OFFLINE_MODE:
-        # Helpful offline stub so your app doesn't explode in local dev.
-        return MailBillsInterpretResponse(
-            ok=True,
-            summary_en="Offline mode: no real interpretation.",
-            summary_translated="Modo sin conexión: sin interpretación real.",
-            fields={
-                "amount_due": FieldValue(value="", confidence=0.0),
-                "due_date": FieldValue(value="", confidence=0.0),
-                "account_number": FieldValue(value="", confidence=0.0),
-                "sender": FieldValue(value="", confidence=0.0),
-                "service_address": FieldValue(value="", confidence=0.0),
-            },
-            reasoning="OFFLINE_MODE=true stub.",
+    raw_bytes = await request.body()
+    if not raw_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="No file provided. Send FormData field 'file' or raw body.",
         )
 
-    if not payload.ocr_text.strip():
-        raise HTTPException(status_code=400, detail="ocr_text is empty.")
+    content_type = request.headers.get(
+        "content-type",
+        "application/octet-stream",
+    )
+    filename = request.headers.get("x-filename", "upload")
 
-    prompt = _build_prompt(payload)
+    wrapped = StarletteUploadFile(
+        filename=filename,
+        file=BytesIO(raw_bytes),
+        content_type=content_type,
+    )
+    return wrapped
+
+
+async def _run_pipeline(file: UploadFile) -> JSONResponse:
+    """
+    Run the OCR pipeline and wrap the result as a JSONResponse.
+    """
     try:
-        raw = await _call_openai_agent(prompt)
+        status_code, body = await run_ocr_pipeline(file)
+        return JSONResponse(status_code=status_code, content=body)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("OpenAI call failed: %s", exc)
-        return MailBillsInterpretResponse(
-            ok=False,
-            error=f"OpenAI call failed: {exc}",
+        logger.exception("OCR pipeline crashed: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": "OCR pipeline crashed",
+                "detail": str(exc),
+            },
         )
 
-    # Normalize fields into FieldValue objects
-    fields_raw = raw.get("fields", {}) if isinstance(raw, dict) else {}
-    normalized_fields: Dict[str, FieldValue] = {}
 
-    for key in ["amount_due", "due_date", "account_number", "sender", "service_address"]:
-        item = fields_raw.get(key, {}) if isinstance(fields_raw, dict) else {}
-        value = item.get("value", "") if isinstance(item, dict) else ""
-        confidence = item.get("confidence", 0.0) if isinstance(item, dict) else 0.0
-        normalized_fields[key] = FieldValue(value=value or "", confidence=float(confidence or 0.0))
-
-    return MailBillsInterpretResponse(
-        ok=True,
-        summary_en=raw.get("summary_en", ""),
-        summary_translated=raw.get("summary_translated", ""),
-        fields=normalized_fields,
-        reasoning=raw.get("reasoning"),
+@app.get("/api/mailbills/parse")
+async def mailbills_parse_alive() -> JSONResponse:
+    """
+    Simple health check for the OCR/parse pipeline.
+    """
+    return JSONResponse(
+        status_code=200,
+        content={"ok": True, "message": "mailbills/parse alive"},
     )
+
+
+@app.post("/api/mailbills/parse")
+async def mailbills_parse(
+    request: Request,
+    file: Optional[UploadFile] = FILE_NONE,
+    target_lang: str = Query(default="en"),
+) -> JSONResponse:
+    """
+    Main OCR endpoint for Mail & Bills:
+    - Accepts file as multipart "file" or raw body
+    - Runs OCR pipeline
+    - Returns OCR JSON (snippet + full text + stub fields)
+    """
+    upload = await _coerce_upload_file(request, file)
+    logger.info(
+        "mailbills/parse received file=%s content_type=%s target_lang=%s",
+        upload.filename,
+        upload.content_type,
+        target_lang,
+    )
+    return await _run_pipeline(upload)
+
+
+@app.get("/api/ocr-debug")
+async def ocr_debug_alive() -> JSONResponse:
+    """
+    Health check for the OCR debug endpoint.
+    """
+    return JSONResponse(
+        status_code=200,
+        content={"ok": True, "message": "ocr-debug alive"},
+    )
+
+
+@app.post("/api/ocr-debug")
+async def ocr_debug(
+    request: Request,
+    file: Optional[UploadFile] = FILE_NONE,
+    target_lang: str = Query(default="en"),
+) -> JSONResponse:
+    """
+    Debug endpoint that uses the same OCR pipeline, but can be called
+    from Postman/curl with extra logging kept on the server.
+    """
+    upload = await _coerce_upload_file(request, file)
+    logger.info(
+        "ocr-debug received file=%s content_type=%s target_lang=%s",
+        upload.filename,
+        upload.content_type,
+        target_lang,
+    )
+    return await _run_pipeline(upload)
