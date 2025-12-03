@@ -7,11 +7,15 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .ocr import run_ocr_pipeline
+from .mailbills_agent import router as mailbills_router  # ✅ NEW: deep agent router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Voyadecir OCR Backend")
+
+# ✅ Include the deep agent routes under /api/mailbills/interpret
+app.include_router(mailbills_router, prefix="/api")
 
 # Ruff B008-friendly: call File() once at module level
 FILE_NONE = File(default=None)
