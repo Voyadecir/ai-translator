@@ -9,12 +9,13 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .ocr import run_ocr_pipeline
 from .mailbills_agent import router as mailbills_router  # deep agent router
+from .translate import router as translate_router        # ✅ translator router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app
-app = FastAPI(title="Voyadecir OCR + MailBills Backend")
+# Create FastAPI app (this is what Render runs: uvicorn ai_translator.api:app)
+app = FastAPI(title="Voyadecir API")
 
 # ✅ CORS: allow your production site(s) to call this API
 origins = [
@@ -30,7 +31,10 @@ app.add_middleware(
     allow_headers=["*"],   # allow Content-Type, Authorization, etc
 )
 
-# ✅ Include deep agent routes under /api/mailbills/interpret, etc.
+# ✅ Include /api/translate (existing translator)
+app.include_router(translate_router, prefix="/api")
+
+# ✅ Include deep agent endpoints: /api/mailbills/interpret
 app.include_router(mailbills_router, prefix="/api")
 
 # Ruff B008-friendly: call File() once at module level
@@ -74,7 +78,7 @@ async def _run_pipeline(file: UploadFile) -> JSONResponse:
     try:
         status_code, body = await run_ocr_pipeline(file)
         return JSONResponse(status_code=status_code, content=body)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.exception("OCR pipeline crashed: %s", exc)
         return JSONResponse(
             status_code=500,
