@@ -1,23 +1,27 @@
+import os
 import logging
 from io import BytesIO
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from .ocr import run_ocr_pipeline
 from .mailbills_agent import router as mailbills_router  # deep agent router
-from .translate import router as translate_router        # ✅ translator router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app (this is what Render runs: uvicorn ai_translator.api:app)
+# -------------------------------------------------------------------------
+# App + CORS
+# -------------------------------------------------------------------------
+
 app = FastAPI(title="Voyadecir API")
 
-# ✅ CORS: allow your production site(s) to call this API
 origins = [
     "https://voyadecir.com",
     "https://www.voyadecir.com",
@@ -27,18 +31,19 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],   # allow GET, POST, OPTIONS, etc
-    allow_headers=["*"],   # allow Content-Type, Authorization, etc
+    allow_methods=["*"],   # GET, POST, OPTIONS, etc
+    allow_headers=["*"],   # Content-Type, Authorization, etc
 )
 
-# ✅ Include /api/translate (existing translator)
-app.include_router(translate_router, prefix="/api")
-
-# ✅ Include deep agent endpoints: /api/mailbills/interpret
+# Deep agent routes: /api/mailbills/interpret
 app.include_router(mailbills_router, prefix="/api")
 
 # Ruff B008-friendly: call File() once at module level
 FILE_NONE = File(default=None)
+
+# -------------------------------------------------------------------------
+# Shared upload helpers (OCR endpoints)
+# -------------------------------------------------------------------------
 
 
 async def _coerce_upload_file(
@@ -90,6 +95,11 @@ async def _run_pipeline(file: UploadFile) -> JSONResponse:
         )
 
 
+# -------------------------------------------------------------------------
+# /api/mailbills/parse  (OCR only)
+# -------------------------------------------------------------------------
+
+
 @app.get("/api/mailbills/parse")
 async def mailbills_parse_alive() -> JSONResponse:
     return JSONResponse(
@@ -114,6 +124,11 @@ async def mailbills_parse(
     return await _run_pipeline(upload)
 
 
+# -------------------------------------------------------------------------
+# /api/ocr-debug
+# -------------------------------------------------------------------------
+
+
 @app.get("/api/ocr-debug")
 async def ocr_debug_alive() -> JSONResponse:
     return JSONResponse(
@@ -136,3 +151,115 @@ async def ocr_debug(
         target_lang,
     )
     return await _run_pipeline(upload)
+
+
+# -------------------------------------------------------------------------
+# /api/translate  (text translation proxy used by site + Azure Functions)
+# -------------------------------------------------------------------------
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
+
+
+class TranslateRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    target_lang: str = Field(
+        "es",
+        description="Target language code, e.g. 'es' or 'en'.",
+    )
+    source_lang: str = Field(
+        "auto",
+        description="Optional source language code, or 'auto'.",
+    )
+
+
+class TranslateResponse(BaseModel):
+    ok: bool
+    translated_text: str
+    translation: str
+    target_lang: str
+    source_lang: str
+
+
+async def _call_openai_translate(payload: TranslateRequest) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured in the environment.")
+
+    system_prompt = (
+        "You are a translation engine. Translate the user text into the requested target language.\n"
+        "Supported languages: English and Spanish.\n"
+        "Return ONLY the translated text, no quotes, no explanations."
+    )
+
+    target = payload.target_lang.strip().lower()
+    if target.startswith("es"):
+        target_label = "Spanish"
+    elif target.startswith("en"):
+        target_label = "English"
+    else:
+        target_label = payload.target_lang
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Target language: {target_label}\nText:\n{payload.text}",
+        },
+    ]
+
+    req_json = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0.0,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=req_json,
+        )
+
+    if resp.status_code >= 300:
+        raise RuntimeError(f"OpenAI translate error {resp.status_code}: {resp.text[:500]}")
+
+    data = resp.json()
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Unexpected OpenAI translate response: {exc}") from exc
+
+    return content.strip()
+
+
+@app.post("/api/translate", response_model=TranslateResponse)
+async def translate_text(req: TranslateRequest) -> TranslateResponse:
+    """
+    Simple translation endpoint.
+
+    Contract:
+      Request JSON: { "text": "...", "target_lang": "es", "source_lang": "auto" }
+      Response JSON: { "ok": true, "translated_text": "...", "translation": "..." }
+    """
+    try:
+        translated = await _call_openai_translate(req)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Translation failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "message": str(exc)},
+        ) from exc
+
+    return TranslateResponse(
+        ok=True,
+        translated_text=translated,
+        translation=translated,  # keep both keys for old frontends
+        target_lang=req.target_lang,
+        source_lang=req.source_lang,
+    )
