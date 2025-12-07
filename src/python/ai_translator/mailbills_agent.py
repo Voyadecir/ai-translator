@@ -18,6 +18,7 @@ HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30.0"))
 # Basic field types
 #
 
+
 class BillField(BaseModel):
     value: str = Field("", description="Extracted value, or empty string if not found.")
     confidence: float = Field(
@@ -103,19 +104,25 @@ class FollowupAction(BaseModel):
 # Request/response shapes
 #
 
+
 class MailBillsRequest(BaseModel):
     ocr_text: str = Field(..., min_length=1, description="Full OCR text from Azure.")
+    # Let the model auto-detect, but we still record the user's intent.
     source_lang: str = Field(
         "auto",
         description="Original language: 'auto', 'en', or 'es'.",
     )
+    # This is what YOU choose in the UI: Spanish or English explanation.
     target_lang: str = Field(
         "es",
-        description="Target language: typically 'es' or 'en'.",
+        description="Target language for the explanation: typically 'es' or 'en'.",
     )
     bill_hint: Optional[str] = Field(
         None,
-        description="Optional hint, e.g. 'electricity bill', 'water bill', 'IRS letter'.",
+        description=(
+            "Optional hint, e.g. 'electricity bill', 'water bill', "
+            "'IRS letter', 'hospital letter', 'school letter', 'work notice'."
+        ),
     )
 
 
@@ -131,12 +138,13 @@ class MailBillsResponse(BaseModel):
     fields: BillFields
     raw_ocr_text: str
 
-    # New richer structure
+    # High-level doc classification
     document_type: str = Field(
         "unknown",
         description=(
-            "High-level type such as 'utility_bill', 'tax_notice', "
-            "'eviction_notice', 'medical_bill', 'traffic_ticket', 'other_info_sheet'."
+            "High-level type such as 'utility_bill', 'medical_bill', 'tax_notice', "
+            "'eviction_notice', 'traffic_ticket', 'court_letter', 'school_letter', "
+            "'work_letter', 'personal_letter', 'other_info_sheet', or 'other'."
         ),
     )
     is_template: bool = Field(
@@ -144,9 +152,10 @@ class MailBillsResponse(BaseModel):
         description="True if this looks like an example / blank form, not a personal bill.",
     )
 
+    # Rich detail
     amounts: List[AmountItem] = Field(
         default_factory=list,
-        description="All amounts the model noticed, including samples or examples.",
+        description="All amounts the model noticed, including examples or sample values.",
     )
     identity_requirements: List[IdentityRequirement] = Field(
         default_factory=list,
@@ -170,31 +179,50 @@ class MailBillsResponse(BaseModel):
 # Prompt construction
 #
 
+
 def _build_system_prompt() -> str:
     return (
-        "You are an assistant that reads OCR text from utility bills or official letters "
-        "in English and Spanish for immigrants and their families. Your job is to:\n"
+        "You are an assistant that reads OCR text from utility bills and official letters "
+        "in English and Spanish for immigrants and their families.\n\n"
+        "Your job is to:\n"
         "1) Understand what kind of document it is.\n"
         "2) Extract key fields: amount_due, due_date, account_number, sender, service_address.\n"
-        "3) List all amounts you see, with labels.\n"
-        "4) Describe what identity information is needed (account number, SSN, etc.).\n"
-        "5) Describe how the person can pay (online, bank, card, mail, etc.).\n"
+        "3) List all amounts you see, with clear labels (even if they are just examples).\n"
+        "4) Describe what identity information is needed (account number, SSN, ticket number, etc.).\n"
+        "5) Describe how the person can pay or respond (online, bank, card, mail, phone, etc.).\n"
         "6) Briefly flag how serious this looks (risk) and simple next steps.\n"
-        "7) Write a short summary in English and the same summary + explanation in the target language.\n\n"
-        "IMPORTANT:\n"
-        "- If the document is clearly a BLANK FORM or SAMPLE (example, template, dotted lines, no real person), "
-        "then set is_template=true, leave fields.amount_due empty, and explain that this is only an example.\n"
-        "- If there are many amounts, choose the main amount the person must pay now for fields.amount_due, "
-        "and put all amounts (examples, fees, totals) inside the 'amounts' list with clear labels.\n\n"
+        "7) ALWAYS write a short summary in English (summary_en).\n"
+        "8) ALSO write the same summary and a simple explanation in the TARGET LANGUAGE "
+        "given by the user (summary_translated and explanation_translated).\n\n"
+        "LANGUAGE RULES:\n"
+        "- summary_en MUST ALWAYS be in English, even if the original document is Spanish.\n"
+        "- The user will provide a target_lang of 'es' or 'en'.\n"
+        "- summary_translated and explanation_translated MUST be written in target_lang.\n"
+        "- If target_lang == 'en', summary_en and summary_translated can be similar or identical.\n\n"
+        "DOCUMENT TYPES & SPECIAL CASES:\n"
+        "- If the document is clearly a BLANK FORM or SAMPLE (example, template, dotted lines, "
+        "placeholder names, no real person), then:\n"
+        "  * set is_template=true,\n"
+        "  * set document_type like 'utility_bill' or 'medical_bill_template',\n"
+        "  * leave fields.amount_due empty, and explain that this is only an example form.\n"
+        "- If there are many amounts, choose the main amount the person must pay now for "
+        "fields.amount_due, and put all amounts (examples, fees, totals) inside the 'amounts' list.\n"
+        "- If the document is a LETTER with no clear bill or fine (for example a doctor letter, "
+        "school letter, work letter, or personal letter with no payment or case number):\n"
+        "  * set document_type to 'doctor_letter', 'school_letter', 'work_letter', or 'personal_letter' "
+        "    if obvious, otherwise 'other_info_sheet',\n"
+        "  * leave fields like amount_due and due_date empty,\n"
+        "  * focus on explaining what the letter is about and any suggested next steps.\n\n"
         "You MUST respond with a single valid JSON object only, no extra text, exactly:\n"
         "{\n"
         '  \"detected_language\": \"en\" | \"es\" | \"other\",\n'
-        '  \"document_type\": \"utility_bill\" | \"tax_notice\" | \"eviction_notice\" | \"medical_bill\" | '
-        '\"traffic_ticket\" | \"other_info_sheet\" | \"other\",\n'
+        '  \"document_type\": \"utility_bill\" | \"medical_bill\" | \"tax_notice\" | '
+        '\"eviction_notice\" | \"traffic_ticket\" | \"court_letter\" | \"school_letter\" | '
+        '\"work_letter\" | \"personal_letter\" | \"other_info_sheet\" | \"other\",\n'
         '  \"is_template\": true | false,\n'
-        '  \"summary_en\": \"...\",\n'
-        '  \"summary_translated\": \"...\",\n'
-        '  \"explanation_translated\": \"...\",\n'
+        '  \"summary_en\": \"...\",            // ALWAYS English\n'
+        '  \"summary_translated\": \"...\",    // ALWAYS in target_lang\n'
+        '  \"explanation_translated\": \"...\",// ALWAYS in target_lang\n'
         '  \"fields\": {\n'
         '    \"amount_due\": { \"value\": \"...\", \"confidence\": 0.0 },\n'
         '    \"due_date\": { \"value\": \"...\", \"confidence\": 0.0 },\n'
@@ -218,8 +246,8 @@ def _build_system_prompt() -> str:
         '    { \"label\": \"...\", \"description\": \"...\" }\n'
         "  ]\n"
         "}\n\n"
-        "If the document does not contain a certain piece of information, use empty strings and empty lists, "
-        "and confidence 0.0. Do not invent URLs or ID numbers."
+        "If the document does not contain a certain piece of information, use empty strings and "
+        "empty lists, and confidence 0.0. Do not invent URLs, ID numbers, or threats that are not present."
     )
 
 
@@ -230,7 +258,7 @@ def _build_user_prompt(payload: MailBillsRequest) -> str:
 
     return (
         f"Source language preference: {payload.source_lang}\n"
-        f"Target language: {payload.target_lang}\n"
+        f"Target language (for translated summary and explanation): {payload.target_lang}\n"
         f"{hint_line}"
         "Here is the OCR text from a bill or letter:\n"
         "----- OCR START -----\n"
@@ -243,6 +271,7 @@ def _build_user_prompt(payload: MailBillsRequest) -> str:
 #
 # OpenAI call
 #
+
 
 async def _call_openai_for_mailbills(payload: MailBillsRequest) -> dict:
     if not OPENAI_API_KEY:
@@ -296,12 +325,29 @@ async def _call_openai_for_mailbills(payload: MailBillsRequest) -> dict:
 # Response builder
 #
 
+
 def _field_from_dict(name: str, source: dict) -> BillField:
     raw = source.get(name) or {}
     return BillField(
         value=str(raw.get("value") or ""),
         confidence=float(raw.get("confidence") or 0.0),
     )
+
+
+def _parse_list(model_cls, key: str, parsed: dict) -> List[BaseModel]:
+    items = parsed.get(key) or []
+    if not isinstance(items, list):
+        return []
+    out: List[BaseModel] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            out.append(model_cls(**item))
+        except Exception:
+            # Skip bad entries rather than crashing.
+            continue
+    return out
 
 
 def _build_response_from_llm(
@@ -322,29 +368,14 @@ def _build_response_from_llm(
         service_address=_field_from_dict("service_address", fields_raw),
     )
 
-    def _parse_list(model_cls, key: str):
-        items = parsed.get(key) or []
-        if not isinstance(items, list):
-            return []
-        out: List[BaseModel] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            try:
-                out.append(model_cls(**item))
-            except Exception:
-                # Be defensive: skip bad entries instead of crashing.
-                continue
-        return out
-
     document_type = parsed.get("document_type") or "unknown"
     is_template = bool(parsed.get("is_template") or False)
 
-    amounts = _parse_list(AmountItem, "amounts")
-    identity_requirements = _parse_list(IdentityRequirement, "identity_requirements")
-    payment_methods = _parse_list(PaymentMethod, "payment_methods")
-    risk_flags = _parse_list(RiskFlag, "risk_flags")
-    followup_actions = _parse_list(FollowupAction, "followup_actions")
+    amounts = _parse_list(AmountItem, "amounts", parsed)
+    identity_requirements = _parse_list(IdentityRequirement, "identity_requirements", parsed)
+    payment_methods = _parse_list(PaymentMethod, "payment_methods", parsed)
+    risk_flags = _parse_list(RiskFlag, "risk_flags", parsed)
+    followup_actions = _parse_list(FollowupAction, "followup_actions", parsed)
 
     return MailBillsResponse(
         ok=True,
@@ -369,11 +400,12 @@ def _build_response_from_llm(
 # Endpoint
 #
 
+
 @router.post("/interpret", response_model=MailBillsResponse)
 async def interpret_mailbills(req: MailBillsRequest) -> MailBillsResponse:
     """
     Deep-agent style endpoint: takes OCR text + optional hints,
-    calls OpenAI, and returns structured bill info.
+    calls OpenAI, and returns structured bill/letter info.
     """
     try:
         parsed = await _call_openai_for_mailbills(req)
