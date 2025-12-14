@@ -42,8 +42,7 @@ class RoadSignsELI5:
         self.parking_signs = self._load_parking_signs()
         self.construction_signs = self._load_construction_signs()
         
-        # Sign shapes and colors
-        self.sign_characteristics = self._load_sign_characteristics()
+       
     
     # ============================================================================
     # REGULATORY SIGNS (Must obey - laws)
