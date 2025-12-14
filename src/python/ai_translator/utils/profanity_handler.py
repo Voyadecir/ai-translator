@@ -187,34 +187,34 @@ class ProfanityHandler:
                 ]
             },
             
-            "bitch": {
-                "intensity": 2,
-                "category": "insult",
-                "context_dependent": True,
-                "es": {
-                    "intensity_match": "perra",
-                    "alternatives": ["zorra", "cabrona"],
-                    "clean_version": "pesada",
-                    "mexico": "perra / cabrona",
-                    "spain": "zorra / puta",
-                    "notes": "Intensity varies by context - can be playful or severe"
-                },
-                "pt": {
-                    "intensity_match": "vadia",
-                    "alternatives": ["puta", "cachorra"],
-                    "clean_version": "chata"
-                },
-                "examples_en": [
-                    "She's a bitch" (mean),
-                    "Life's a bitch" (expression),
-                    "Quit bitching" (complaining)
-                ],
-                "examples_es": [
-                    "Es una perra" (mean),
-                    "La vida es una perra" (expression),
-                    "Deja de quejarte"
-                ]
-            },
+           "bitch": {
+    "intensity": 2,
+    "category": "insult",
+    "context_dependent": True,
+    "es": {
+        "intensity_match": "perra",
+        "alternatives": ["zorra", "cabrona"],
+        "clean_version": "pesada",
+        "mexico": "perra / cabrona",
+        "spain": "zorra / puta",
+        "notes": "Intensity varies by context - can be playful or severe"
+    },
+    "pt": {
+        "intensity_match": "vadia",
+        "alternatives": ["puta", "cachorra"],
+        "clean_version": "chata"
+    },
+    "examples_en": [
+        "She's a bitch (mean)",
+        "Life's a bitch (expression)",
+        "Quit bitching (complaining)"
+    ],
+    "examples_es": [
+        "Es una perra (mean)",
+        "La vida es una perra (expression)",
+        "Deja de quejarte"
+    ]
+},
             
             "asshole": {
                 "intensity": 2,
