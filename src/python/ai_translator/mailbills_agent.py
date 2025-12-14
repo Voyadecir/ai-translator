@@ -33,13 +33,12 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 from openai import AzureOpenAI
 
-# Import all utility modules
-from ..utils.ocr_preprocessor import ocr_preprocessor, preprocess_for_ocr, assess_image
-from ..utils.ocr_postprocessor import ocr_postprocessor, clean_ocr_output
-from ..utils.translation_engine import translation_engine, translate_text
-from ..utils.translation_dictionaries import get_translation, AUTHORITATIVE_SOURCES
-from ..utils.ui_translation import ui_translator
-
+# Import all utility modules (SINGLE DOT = correct relative path)
+from .utils.ocr_preprocessor import ocr_preprocessor, preprocess_for_ocr, assess_image
+from .utils.ocr_postprocessor import ocr_postprocessor, clean_ocr_output
+from .utils.translation_engine import translation_engine, translate_text
+from .utils.translation_dictionaries import get_translation, AUTHORITATIVE_SOURCES
+from .utils.ui_translation import ui_translator
 logger = logging.getLogger(__name__)
 
 class MailBillsAgent:
