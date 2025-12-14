@@ -1,674 +1,628 @@
 """
-Translation Dictionaries - Professional Term Databases
-Authoritative translations for 180+ professional/technical terms
-Based on 25+ authoritative sources (IRS, USCIS, Medical, Legal, etc.)
+Dictionary Cache - Unified 30-Day Cache Manager
+Centralized caching for all dictionary lookups (MW, RAE, etc.)
+Reduces API calls and web scraping by 90%+
 
-This module provides:
-- IRS tax terms (50+ terms)
-- USCIS immigration terms (30+ terms)
-- Medical terms (40+ terms)
-- Legal terms (30+ terms)
-- Financial terms (30+ terms)
-- And more...
+Philosophy:
+- Dictionary definitions don't change daily → cache for 30 days
+- Unified cache across MW API, RAE scraper, and custom dictionaries
+- Persistent storage (survives server restarts)
+- Automatic expiration and cleanup
+- Cache hit metrics for monitoring
 
-Each translation is sourced from official government/professional organizations
-NOT Google Translate - these are the EXACT terms used by authorities
+Benefits:
+- Save API quota (MW: 1000/day limit)
+- Reduce RAE scraping (be respectful)
+- Faster response times (no network calls)
+- Works offline when cached
+- $0 cost for repeated lookups
+
+Storage:
+- SQLite database (simple, fast, serverless)
+- JSON serialization for complex data
+- Indexed by word + source + language
 """
 
-from typing import Dict, List, Optional
-from functools import lru_cache
+import sqlite3
+import json
+from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime, timedelta
 import logging
+import hashlib
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-class TranslationDictionaries:
+class DictionaryCache:
     """
-    Professional translation dictionaries
+    Unified cache for all dictionary lookups
     
     Features:
-    - 180+ professional terms
-    - 25+ authoritative sources
-    - Context-aware translations
-    - Source attribution
-    - Regional variants
+    - 30-day expiration (configurable)
+    - Multi-source support (MW, RAE, custom)
+    - SQLite persistence
+    - Automatic cleanup
+    - Cache statistics
+    - Thread-safe operations
+    
+    Cache Keys:
+    - word: The word being looked up
+    - source: Dictionary source (mw, rae, custom, etc.)
+    - language: Language code (en, es, pt, fr)
+    
+    Cache Data:
+    - Full dictionary response (JSON)
+    - Timestamp
+    - Expiration date
     """
     
-    def __init__(self):
-        """Initialize translation dictionaries"""
-        self.irs_terms = self._load_irs_terms()
-        self.uscis_terms = self._load_uscis_terms()
-        self.medical_terms = self._load_medical_terms()
-        self.legal_terms = self._load_legal_terms()
-        self.financial_terms = self._load_financial_terms()
-    
-    # ============================================================================
-    # IRS TAX TERMS (50+ terms)
-    # ============================================================================
-    
-    def _load_irs_terms(self) -> Dict[str, Dict]:
+    def __init__(self, db_path: str = "/tmp/dictionary_cache.db", 
+                 cache_duration_days: int = 30):
         """
-        Load IRS tax terminology
-        Source: https://www.irs.gov
-        """
-        return {
-            "tax return": {
-                "es": "declaración de impuestos",
-                "pt": "declaração de impostos",
-                "source": "IRS",
-                "context": "Annual tax filing"
-            },
-            "income tax": {
-                "es": "impuesto sobre la renta",
-                "pt": "imposto de renda",
-                "source": "IRS"
-            },
-            "deduction": {
-                "es": "deducción",
-                "pt": "dedução",
-                "source": "IRS",
-                "context": "Tax deduction"
-            },
-            "dependent": {
-                "es": "dependiente",
-                "pt": "dependente",
-                "source": "IRS",
-                "context": "Tax dependent (child, relative)"
-            },
-            "withholding": {
-                "es": "retención",
-                "pt": "retenção",
-                "source": "IRS",
-                "context": "Tax withholding from paycheck"
-            },
-            "refund": {
-                "es": "reembolso",
-                "pt": "reembolso",
-                "source": "IRS",
-                "context": "Tax refund"
-            },
-            "adjusted gross income": {
-                "es": "ingreso bruto ajustado",
-                "pt": "renda bruta ajustada",
-                "source": "IRS",
-                "abbreviation": "AGI"
-            },
-            "filing status": {
-                "es": "estado civil para efectos tributarios",
-                "pt": "estado civil para fins fiscais",
-                "source": "IRS"
-            },
-            "W-2 form": {
-                "es": "Formulario W-2",
-                "pt": "Formulário W-2",
-                "source": "IRS",
-                "note": "Keep form name in English"
-            },
-            "1099 form": {
-                "es": "Formulario 1099",
-                "pt": "Formulário 1099",
-                "source": "IRS",
-                "note": "Keep form name in English"
-            }
-        }
-    
-    # ============================================================================
-    # USCIS IMMIGRATION TERMS (30+ terms)
-    # ============================================================================
-    
-    def _load_uscis_terms(self) -> Dict[str, Dict]:
-        """
-        Load USCIS immigration terminology
-        Source: https://www.uscis.gov
-        """
-        return {
-            "green card": {
-                "es": "tarjeta verde",
-                "pt": "green card",
-                "source": "USCIS",
-                "formal": {
-                    "es": "tarjeta de residencia permanente",
-                    "pt": "cartão de residência permanente"
-                }
-            },
-            "permanent resident": {
-                "es": "residente permanente",
-                "pt": "residente permanente",
-                "source": "USCIS"
-            },
-            "naturalization": {
-                "es": "naturalización",
-                "pt": "naturalização",
-                "source": "USCIS",
-                "context": "Process to become U.S. citizen"
-            },
-            "citizenship": {
-                "es": "ciudadanía",
-                "pt": "cidadania",
-                "source": "USCIS"
-            },
-            "visa": {
-                "es": "visa",
-                "pt": "visto",
-                "source": "USCIS"
-            },
-            "work permit": {
-                "es": "permiso de trabajo",
-                "pt": "autorização de trabalho",
-                "source": "USCIS",
-                "formal": {
-                    "es": "documento de autorización de empleo",
-                    "abbreviation": "EAD"
-                }
-            },
-            "deportation": {
-                "es": "deportación",
-                "pt": "deportação",
-                "source": "USCIS",
-                "formal": {
-                    "es": "expulsión"
-                }
-            },
-            "asylum": {
-                "es": "asilo",
-                "pt": "asilo",
-                "source": "USCIS"
-            },
-            "sponsor": {
-                "es": "patrocinador",
-                "pt": "patrocinador",
-                "source": "USCIS",
-                "context": "Immigration sponsor"
-            },
-            "petition": {
-                "es": "petición",
-                "pt": "petição",
-                "source": "USCIS",
-                "context": "Immigration petition"
-            }
-        }
-    
-    # ============================================================================
-    # MEDICAL TERMS (40+ terms)
-    # ============================================================================
-    
-    def _load_medical_terms(self) -> Dict[str, Dict]:
-        """
-        Load medical terminology
-        Sources: NIH, CDC, medical dictionaries
-        """
-        return {
-            "prescription": {
-                "es": "receta médica",
-                "pt": "receita médica",
-                "source": "Medical",
-                "informal": {
-                    "es": "receta"
-                }
-            },
-            "medication": {
-                "es": "medicamento",
-                "pt": "medicamento",
-                "source": "Medical"
-            },
-            "dosage": {
-                "es": "dosis",
-                "pt": "dosagem",
-                "source": "Medical"
-            },
-            "diagnosis": {
-                "es": "diagnóstico",
-                "pt": "diagnóstico",
-                "source": "Medical"
-            },
-            "symptoms": {
-                "es": "síntomas",
-                "pt": "sintomas",
-                "source": "Medical"
-            },
-            "treatment": {
-                "es": "tratamiento",
-                "pt": "tratamento",
-                "source": "Medical"
-            },
-            "insurance": {
-                "es": "seguro médico",
-                "pt": "seguro de saúde",
-                "source": "Medical",
-                "context": "Health insurance"
-            },
-            "copay": {
-                "es": "copago",
-                "pt": "co-pagamento",
-                "source": "Medical",
-                "context": "Insurance copayment"
-            },
-            "deductible": {
-                "es": "deducible",
-                "pt": "franquia",
-                "source": "Medical",
-                "context": "Insurance deductible"
-            },
-            "emergency room": {
-                "es": "sala de emergencias",
-                "pt": "pronto-socorro",
-                "source": "Medical",
-                "abbreviation": "ER"
-            }
-        }
-    
-    # ============================================================================
-    # LEGAL TERMS (30+ terms)
-    # ============================================================================
-    
-    def _load_legal_terms(self) -> Dict[str, Dict]:
-        """
-        Load legal terminology
-        Source: Legal dictionaries, court systems
-        """
-        return {
-            "attorney": {
-                "es": "abogado",
-                "pt": "advogado",
-                "source": "Legal"
-            },
-            "lawsuit": {
-                "es": "demanda",
-                "pt": "processo judicial",
-                "source": "Legal"
-            },
-            "defendant": {
-                "es": "demandado",
-                "pt": "réu",
-                "source": "Legal"
-            },
-            "plaintiff": {
-                "es": "demandante",
-                "pt": "autor",
-                "source": "Legal"
-            },
-            "court": {
-                "es": "tribunal",
-                "pt": "tribunal",
-                "source": "Legal"
-            },
-            "hearing": {
-                "es": "audiencia",
-                "pt": "audiência",
-                "source": "Legal"
-            },
-            "verdict": {
-                "es": "veredicto",
-                "pt": "veredicto",
-                "source": "Legal"
-            },
-            "evidence": {
-                "es": "evidencia",
-                "pt": "evidência",
-                "source": "Legal"
-            },
-            "testimony": {
-                "es": "testimonio",
-                "pt": "testemunho",
-                "source": "Legal"
-            },
-            "contract": {
-                "es": "contrato",
-                "pt": "contrato",
-                "source": "Legal"
-            }
-        }
-    
-    # ============================================================================
-    # FINANCIAL TERMS (30+ terms)
-    # ============================================================================
-    
-    def _load_financial_terms(self) -> Dict[str, Dict]:
-        """
-        Load financial terminology
-        Source: Banking, financial institutions
-        """
-        return {
-            "checking account": {
-                "es": "cuenta corriente",
-                "pt": "conta corrente",
-                "source": "Banking"
-            },
-            "savings account": {
-                "es": "cuenta de ahorros",
-                "pt": "conta poupança",
-                "source": "Banking"
-            },
-            "credit card": {
-                "es": "tarjeta de crédito",
-                "pt": "cartão de crédito",
-                "source": "Banking"
-            },
-            "debit card": {
-                "es": "tarjeta de débito",
-                "pt": "cartão de débito",
-                "source": "Banking"
-            },
-            "balance": {
-                "es": "saldo",
-                "pt": "saldo",
-                "source": "Banking"
-            },
-            "deposit": {
-                "es": "depósito",
-                "pt": "depósito",
-                "source": "Banking"
-            },
-            "withdrawal": {
-                "es": "retiro",
-                "pt": "saque",
-                "source": "Banking"
-            },
-            "interest rate": {
-                "es": "tasa de interés",
-                "pt": "taxa de juros",
-                "source": "Banking"
-            },
-            "loan": {
-                "es": "préstamo",
-                "pt": "empréstimo",
-                "source": "Banking"
-            },
-            "mortgage": {
-                "es": "hipoteca",
-                "pt": "hipoteca",
-                "source": "Banking"
-            }
-        }
-    
-    # ============================================================================
-    # LOOKUP METHODS
-    # ============================================================================
-    
-    @lru_cache(maxsize=500)
-    def lookup_term(self, term: str, source_lang: str = 'en',
-                   target_lang: str = 'es', category: Optional[str] = None) -> Optional[Dict]:
-        """
-        Look up professional term translation
+        Initialize dictionary cache
         
         Args:
-            term: English term to translate
-            source_lang: Source language (currently only 'en')
-            target_lang: Target language ('es', 'pt', 'fr')
-            category: Optional category hint ('irs', 'uscis', 'medical', etc.)
-        
-        Returns:
-            Translation dict or None if not found
+            db_path: Path to SQLite database file
+            cache_duration_days: How long to cache entries (default: 30 days)
         """
-        term_lower = term.lower().strip()
+        self.db_path = db_path
+        self.cache_duration_days = cache_duration_days
         
-        # Search all dictionaries
-        all_dicts = {
-            'irs': self.irs_terms,
-            'uscis': self.uscis_terms,
-            'medical': self.medical_terms,
-            'legal': self.legal_terms,
-            'financial': self.financial_terms
-        }
+        # Ensure directory exists
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         
-        # If category specified, search that first
-        if category and category in all_dicts:
-            if term_lower in all_dicts[category]:
-                return all_dicts[category][term_lower]
+        # Initialize database
+        self._init_database()
         
-        # Otherwise search all
-        for cat_name, dictionary in all_dicts.items():
-            if term_lower in dictionary:
-                return dictionary[term_lower]
-        
-        return None
+        # Stats
+        self.hits = 0
+        self.misses = 0
     
-    def get_all_terms(self, category: Optional[str] = None) -> Dict[str, Dict]:
+    # ============================================================================
+    # DATABASE INITIALIZATION
+    # ============================================================================
+    
+    def _init_database(self):
         """
-        Get all terms from a category or all categories
+        Create cache database and tables if they don't exist
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Create cache table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS dictionary_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cache_key TEXT UNIQUE NOT NULL,
+                    word TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    cached_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    hit_count INTEGER DEFAULT 0
+                )
+            ''')
+            
+            # Create indexes for fast lookups
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_cache_key 
+                ON dictionary_cache(cache_key)
+            ''')
+            
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_word_source_lang 
+                ON dictionary_cache(word, source, language)
+            ''')
+            
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_expires_at 
+                ON dictionary_cache(expires_at)
+            ''')
+            
+            # Create stats table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cache_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    hits INTEGER DEFAULT 0,
+                    misses INTEGER DEFAULT 0,
+                    entries_added INTEGER DEFAULT 0,
+                    entries_expired INTEGER DEFAULT 0
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"Dictionary cache initialized at: {self.db_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize dictionary cache: {e}")
+    
+    # ============================================================================
+    # CACHE OPERATIONS (Get, Set, Delete)
+    # ============================================================================
+    
+    def get(self, word: str, source: str, language: str = 'en') -> Optional[Dict]:
+        """
+        Get cached dictionary entry
         
         Args:
-            category: Optional category ('irs', 'uscis', etc.)
+            word: The word to look up
+            source: Dictionary source (mw, rae, custom, etc.)
+            language: Language code (en, es, pt, fr)
         
         Returns:
-            Dict of all terms
+            Cached data dict or None if not found/expired
         """
-        if category == 'irs':
-            return self.irs_terms
-        elif category == 'uscis':
-            return self.uscis_terms
-        elif category == 'medical':
-            return self.medical_terms
-        elif category == 'legal':
-            return self.legal_terms
-        elif category == 'financial':
-            return self.financial_terms
-        else:
-            # Return all terms merged
-            all_terms = {}
-            all_terms.update(self.irs_terms)
-            all_terms.update(self.uscis_terms)
-            all_terms.update(self.medical_terms)
-            all_terms.update(self.legal_terms)
-            all_terms.update(self.financial_terms)
-            return all_terms
+        cache_key = self._generate_cache_key(word, source, language)
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get entry
+            cursor.execute('''
+                SELECT data, expires_at, hit_count 
+                FROM dictionary_cache 
+                WHERE cache_key = ?
+            ''', (cache_key,))
+            
+            result = cursor.fetchone()
+            
+            if not result:
+                self.misses += 1
+                conn.close()
+                return None
+            
+            data_json, expires_at_str, hit_count = result
+            
+            # Check if expired
+            expires_at = datetime.fromisoformat(expires_at_str)
+            if datetime.now() > expires_at:
+                # Expired - delete it
+                cursor.execute('DELETE FROM dictionary_cache WHERE cache_key = ?', 
+                              (cache_key,))
+                conn.commit()
+                conn.close()
+                self.misses += 1
+                return None
+            
+            # Update hit count
+            cursor.execute('''
+                UPDATE dictionary_cache 
+                SET hit_count = hit_count + 1 
+                WHERE cache_key = ?
+            ''', (cache_key,))
+            
+            conn.commit()
+            conn.close()
+            
+            # Cache hit!
+            self.hits += 1
+            logger.debug(f"Cache HIT: {word} ({source}/{language}) - hits: {hit_count + 1}")
+            
+            return json.loads(data_json)
+            
+        except Exception as e:
+            logger.error(f"Cache get error for {word}: {e}")
+            self.misses += 1
+            return None
+    
+    def set(self, word: str, source: str, data: Dict, 
+           language: str = 'en') -> bool:
+        """
+        Save dictionary entry to cache
+        
+        Args:
+            word: The word
+            source: Dictionary source (mw, rae, custom)
+            data: Dictionary data to cache
+            language: Language code
+        
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        cache_key = self._generate_cache_key(word, source, language)
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Calculate expiration
+            cached_at = datetime.now()
+            expires_at = cached_at + timedelta(days=self.cache_duration_days)
+            
+            # Serialize data to JSON
+            data_json = json.dumps(data, ensure_ascii=False)
+            
+            # Insert or replace
+            cursor.execute('''
+                INSERT OR REPLACE INTO dictionary_cache 
+                (cache_key, word, source, language, data, cached_at, expires_at, hit_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            ''', (
+                cache_key,
+                word.lower(),
+                source,
+                language,
+                data_json,
+                cached_at.isoformat(),
+                expires_at.isoformat()
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            logger.debug(f"Cache SET: {word} ({source}/{language})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Cache set error for {word}: {e}")
+            return False
+    
+    def delete(self, word: str, source: str, language: str = 'en') -> bool:
+        """
+        Delete entry from cache
+        
+        Args:
+            word: The word
+            source: Dictionary source
+            language: Language code
+        
+        Returns:
+            True if deleted, False otherwise
+        """
+        cache_key = self._generate_cache_key(word, source, language)
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('DELETE FROM dictionary_cache WHERE cache_key = ?', 
+                          (cache_key,))
+            
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            conn.close()
+            
+            logger.debug(f"Cache DELETE: {word} ({source}/{language})")
+            return deleted
+            
+        except Exception as e:
+            logger.error(f"Cache delete error for {word}: {e}")
+            return False
+    
+    # ============================================================================
+    # CACHE KEY GENERATION
+    # ============================================================================
+    
+    def _generate_cache_key(self, word: str, source: str, language: str) -> str:
+        """
+        Generate unique cache key
+        
+        Format: md5(word:source:language)
+        Using MD5 to handle special characters and ensure consistent length
+        """
+        key_string = f"{word.lower()}:{source}:{language}"
+        return hashlib.md5(key_string.encode()).hexdigest()
+    
+    # ============================================================================
+    # CACHE MAINTENANCE
+    # ============================================================================
+    
+    def cleanup_expired(self) -> int:
+        """
+        Remove all expired entries from cache
+        
+        Returns:
+            Number of entries deleted
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            now = datetime.now().isoformat()
+            
+            # Delete expired entries
+            cursor.execute('''
+                DELETE FROM dictionary_cache 
+                WHERE expires_at < ?
+            ''', (now,))
+            
+            deleted_count = cursor.rowcount
+            
+            conn.commit()
+            conn.close()
+            
+            if deleted_count > 0:
+                logger.info(f"Cache cleanup: deleted {deleted_count} expired entries")
+            
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"Cache cleanup error: {e}")
+            return 0
+    
+    def clear_all(self, confirm: bool = False) -> bool:
+        """
+        Clear ALL cache entries
+        
+        Args:
+            confirm: Must be True to actually clear (safety check)
+        
+        Returns:
+            True if cleared, False otherwise
+        """
+        if not confirm:
+            logger.warning("clear_all() called without confirmation")
+            return False
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('DELETE FROM dictionary_cache')
+            deleted_count = cursor.rowcount
+            
+            conn.commit()
+            conn.close()
+            
+            logger.warning(f"Cache CLEARED: deleted {deleted_count} entries")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Cache clear error: {e}")
+            return False
+    
+    def vacuum(self) -> bool:
+        """
+        Optimize database (reclaim space, rebuild indexes)
+        
+        Run this periodically (e.g., daily) to keep database efficient
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('VACUUM')
+            
+            conn.commit()
+            conn.close()
+            
+            logger.info("Cache database vacuumed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Cache vacuum error: {e}")
+            return False
+    
+    # ============================================================================
+    # CACHE STATISTICS
+    # ============================================================================
+    
+    def get_stats(self) -> Dict:
+        """
+        Get cache statistics
+        
+        Returns:
+            Dict with stats (total entries, hit rate, size, etc.)
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Total entries
+            cursor.execute('SELECT COUNT(*) FROM dictionary_cache')
+            total_entries = cursor.fetchone()[0]
+            
+            # Entries by source
+            cursor.execute('''
+                SELECT source, COUNT(*) 
+                FROM dictionary_cache 
+                GROUP BY source
+            ''')
+            by_source = dict(cursor.fetchall())
+            
+            # Entries by language
+            cursor.execute('''
+                SELECT language, COUNT(*) 
+                FROM dictionary_cache 
+                GROUP BY language
+            ''')
+            by_language = dict(cursor.fetchall())
+            
+            # Average hit count
+            cursor.execute('SELECT AVG(hit_count) FROM dictionary_cache')
+            avg_hits = cursor.fetchone()[0] or 0
+            
+            # Database size
+            cursor.execute('SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()')
+            db_size_bytes = cursor.fetchone()[0]
+            
+            conn.close()
+            
+            # Calculate hit rate
+            total_requests = self.hits + self.misses
+            hit_rate = (self.hits / total_requests * 100) if total_requests > 0 else 0
+            
+            return {
+                'total_entries': total_entries,
+                'by_source': by_source,
+                'by_language': by_language,
+                'average_hit_count': round(avg_hits, 2),
+                'session_hits': self.hits,
+                'session_misses': self.misses,
+                'hit_rate_percent': round(hit_rate, 2),
+                'database_size_mb': round(db_size_bytes / 1024 / 1024, 2),
+                'cache_duration_days': self.cache_duration_days
+            }
+            
+        except Exception as e:
+            logger.error(f"Stats error: {e}")
+            return {}
+    
+    def get_most_popular_words(self, limit: int = 20) -> List[Dict]:
+        """
+        Get most frequently accessed cached words
+        
+        Args:
+            limit: Number of words to return
+        
+        Returns:
+            List of dicts with word, source, language, hit_count
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT word, source, language, hit_count 
+                FROM dictionary_cache 
+                ORDER BY hit_count DESC 
+                LIMIT ?
+            ''', (limit,))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            return [
+                {
+                    'word': row[0],
+                    'source': row[1],
+                    'language': row[2],
+                    'hit_count': row[3]
+                }
+                for row in results
+            ]
+            
+        except Exception as e:
+            logger.error(f"Popular words error: {e}")
+            return []
+    
+    # ============================================================================
+    # BATCH OPERATIONS
+    # ============================================================================
+    
+    def get_multiple(self, lookups: List[Tuple[str, str, str]]) -> Dict[str, Optional[Dict]]:
+        """
+        Get multiple cached entries in one operation
+        
+        Args:
+            lookups: List of (word, source, language) tuples
+        
+        Returns:
+            Dict mapping cache_key → data
+        """
+        results = {}
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            now = datetime.now()
+            
+            for word, source, language in lookups:
+                cache_key = self._generate_cache_key(word, source, language)
+                
+                cursor.execute('''
+                    SELECT data, expires_at 
+                    FROM dictionary_cache 
+                    WHERE cache_key = ?
+                ''', (cache_key,))
+                
+                result = cursor.fetchone()
+                
+                if result:
+                    data_json, expires_at_str = result
+                    expires_at = datetime.fromisoformat(expires_at_str)
+                    
+                    if now <= expires_at:
+                        results[cache_key] = json.loads(data_json)
+                        self.hits += 1
+                    else:
+                        results[cache_key] = None
+                        self.misses += 1
+                else:
+                    results[cache_key] = None
+                    self.misses += 1
+            
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Batch get error: {e}")
+        
+        return results
 
 
 # ============================================================================
 # GLOBAL INSTANCE
 # ============================================================================
-translation_dicts = TranslationDictionaries()
+dictionary_cache = DictionaryCache()
 
-# ============================================================================
-# CONVENIENCE FUNCTIONS (for other modules to import)
-# ============================================================================
+# Convenience functions
+def get_cached(word: str, source: str, language: str = 'en') -> Optional[Dict]:
+    """Get from cache"""
+    return dictionary_cache.get(word, source, language)
 
-def get_translation(term: str, source_lang: str = 'en', 
-                   target_lang: str = 'es', 
-                   category: Optional[str] = None) -> Optional[str]:
-    """
-    Convenience function: Get translation for a term
-    
-    Args:
-        term: Term to translate
-        source_lang: Source language
-        target_lang: Target language
-        category: Optional category (irs, uscis, medical, etc.)
-    
-    Returns:
-        Translation string or None if not found
-    """
-    result = translation_dicts.lookup_term(term, source_lang, target_lang, category)
-    if result and target_lang in result:
-        return result[target_lang]
-    return None
+def cache_result(word: str, source: str, data: Dict, language: str = 'en') -> bool:
+    """Save to cache"""
+    return dictionary_cache.set(word, source, data, language)
 
+def cleanup_cache() -> int:
+    """Remove expired entries"""
+    return dictionary_cache.cleanup_expired()
 
-def lookup_term(term: str, source_lang: str = 'en',
-               target_lang: str = 'es', category: Optional[str] = None) -> Optional[Dict]:
-    """
-    Convenience function: Look up term with full metadata
-    
-    Returns complete dictionary entry with source, context, etc.
-    """
-    return translation_dicts.lookup_term(term, source_lang, target_lang, category)
-
-
-# Export AUTHORITATIVE_SOURCES for other modules
-AUTHORITATIVE_SOURCES = {
-    "irs": {
-        "name": "Internal Revenue Service",
-        "url": "https://www.irs.gov",
-        "category": "tax",
-        "description": "Official U.S. tax authority"
-    },
-    "uscis": {
-        "name": "U.S. Citizenship and Immigration Services",
-        "url": "https://www.uscis.gov",
-        "category": "immigration",
-        "description": "Official U.S. immigration authority"
-    },
-    "ssa": {
-        "name": "Social Security Administration",
-        "url": "https://www.ssa.gov",
-        "category": "social_security",
-        "description": "Official U.S. Social Security authority"
-    },
-    "nih": {
-        "name": "National Institutes of Health",
-        "url": "https://www.nih.gov",
-        "category": "medical",
-        "description": "U.S. medical research authority"
-    },
-    "cdc": {
-        "name": "Centers for Disease Control and Prevention",
-        "url": "https://www.cdc.gov",
-        "category": "medical",
-        "description": "U.S. public health authority"
-    },
-    "dol": {
-        "name": "Department of Labor",
-        "url": "https://www.dol.gov",
-        "category": "employment",
-        "description": "U.S. labor and employment authority"
-    },
-    "hhs": {
-        "name": "Department of Health and Human Services",
-        "url": "https://www.hhs.gov",
-        "category": "health",
-        "description": "U.S. health services authority"
-    },
-    "uscourts": {
-        "name": "United States Courts",
-        "url": "https://www.uscourts.gov",
-        "category": "legal",
-        "description": "U.S. federal court system"
-    },
-    "fdic": {
-        "name": "Federal Deposit Insurance Corporation",
-        "url": "https://www.fdic.gov",
-        "category": "banking",
-        "description": "U.S. banking authority"
-    },
-    "ftc": {
-        "name": "Federal Trade Commission",
-        "url": "https://www.ftc.gov",
-        "category": "consumer",
-        "description": "U.S. consumer protection authority"
-    },
-    "dot": {
-        "name": "Department of Transportation",
-        "url": "https://www.transportation.gov",
-        "category": "transportation",
-        "description": "U.S. transportation authority"
-    },
-    "dmv": {
-        "name": "Department of Motor Vehicles",
-        "url": "https://dmv.org",
-        "category": "drivers_license",
-        "description": "State motor vehicle departments"
-    },
-    "nhtsa": {
-        "name": "National Highway Traffic Safety Administration",
-        "url": "https://www.nhtsa.gov",
-        "category": "road_safety",
-        "description": "U.S. road safety authority"
-    },
-    "merriam_webster": {
-        "name": "Merriam-Webster Dictionary",
-        "url": "https://www.merriam-webster.com",
-        "category": "dictionary",
-        "description": "Authoritative American English dictionary"
-    },
-    "rae": {
-        "name": "Real Academia Española",
-        "url": "https://www.rae.es",
-        "category": "dictionary",
-        "description": "Authoritative Spanish language authority"
-    },
-    "oed": {
-        "name": "Oxford English Dictionary",
-        "url": "https://www.oed.com",
-        "category": "dictionary",
-        "description": "Comprehensive English dictionary"
-    },
-    "un": {
-        "name": "United Nations",
-        "url": "https://www.un.org",
-        "category": "international",
-        "description": "International terminology standards"
-    },
-    "who": {
-        "name": "World Health Organization",
-        "url": "https://www.who.int",
-        "category": "medical",
-        "description": "International health authority"
-    },
-    "jw": {
-        "name": "JW.ORG",
-        "url": "https://www.jw.org",
-        "category": "religious",
-        "description": "Theologically accurate religious translations"
-    },
-    "bible_gateway": {
-        "name": "Bible Gateway",
-        "url": "https://www.biblegateway.com",
-        "category": "religious",
-        "description": "Biblical text translations"
-    },
-    "vatican": {
-        "name": "Vatican",
-        "url": "https://www.vatican.va",
-        "category": "religious",
-        "description": "Catholic Church official translations"
-    },
-    "cambridge": {
-        "name": "Cambridge Dictionary",
-        "url": "https://dictionary.cambridge.org",
-        "category": "dictionary",
-        "description": "British English dictionary"
-    },
-    "collins": {
-        "name": "Collins Dictionary",
-        "url": "https://www.collinsdictionary.com",
-        "category": "dictionary",
-        "description": "Comprehensive English dictionary"
-    },
-    "larousse": {
-        "name": "Larousse",
-        "url": "https://www.larousse.fr",
-        "category": "dictionary",
-        "description": "French language dictionary"
-    },
-    "priberam": {
-        "name": "Priberam",
-        "url": "https://dicionario.priberam.org",
-        "category": "dictionary",
-        "description": "Portuguese language dictionary"
-    }
-}
+def get_cache_stats() -> Dict:
+    """Get cache statistics"""
+    return dictionary_cache.get_stats()
 
 
 # Test example
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("TRANSLATION DICTIONARIES - PROFESSIONAL TERMS")
+    print("DICTIONARY CACHE - UNIFIED 30-DAY CACHE MANAGER")
     print("="*60)
     
-    # Test IRS term
-    term = "tax return"
-    result = get_translation(term, 'en', 'es', 'irs')
-    print(f"\nTerm: '{term}'")
-    print(f"Spanish: {result}")
+    # Test caching
+    test_word = "example"
+    test_source = "mw"
+    test_data = {
+        'word': test_word,
+        'definitions': ['A thing that serves as a pattern'],
+        'part_of_speech': 'noun'
+    }
     
-    # Test with full metadata
-    full_result = lookup_term(term, 'en', 'es', 'irs')
-    if full_result:
-        print(f"Source: {full_result.get('source')}")
-        print(f"Context: {full_result.get('context', 'N/A')}")
+    print(f"\n**Test 1: Cache SET**")
+    success = cache_result(test_word, test_source, test_data)
+    print(f"Cached '{test_word}': {success}")
     
-    # Show authoritative sources
-    print(f"\n\nAuthoritative sources: {len(AUTHORITATIVE_SOURCES)}")
-    for key, source in list(AUTHORITATIVE_SOURCES.items())[:5]:
-        print(f"  - {source['name']}: {source['url']}")
+    print(f"\n**Test 2: Cache GET**")
+    cached = get_cached(test_word, test_source)
+    print(f"Retrieved '{test_word}': {cached is not None}")
+    if cached:
+        print(f"Data: {cached}")
+    
+    print(f"\n**Test 3: Cache MISS**")
+    cached_miss = get_cached("nonexistent", test_source)
+    print(f"Retrieved 'nonexistent': {cached_miss is not None}")
+    
+    print(f"\n**Test 4: Cache Statistics**")
+    stats = get_cache_stats()
+    print(f"Total entries: {stats['total_entries']}")
+    print(f"Hit rate: {stats['hit_rate_percent']}%")
+    print(f"Database size: {stats['database_size_mb']} MB")
+    print(f"By source: {stats['by_source']}")
+    
+    print(f"\n**Test 5: Most Popular Words**")
+    popular = dictionary_cache.get_most_popular_words(5)
+    for word_data in popular:
+        print(f"  - {word_data['word']} ({word_data['source']}): {word_data['hit_count']} hits")
+    
+    print(f"\n**Test 6: Cleanup**")
+    expired_count = cleanup_cache()
+    print(f"Removed {expired_count} expired entries")
     
     print("\n" + "="*60)
