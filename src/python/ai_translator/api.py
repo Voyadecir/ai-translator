@@ -1,8 +1,7 @@
 import os
 import logging
 from io import BytesIO
-from typing import Optional
-
+from typing import Optional, Dict, Any
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -19,7 +18,6 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------------------
 # App + CORS
 # -------------------------------------------------------------------------
-
 app = FastAPI(title="Voyadecir API")
 
 origins = [
@@ -31,8 +29,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],   # GET, POST, OPTIONS, etc
-    allow_headers=["*"],   # Content-Type, Authorization, etc
+    allow_methods=["*"],  # GET, POST, OPTIONS, etc
+    allow_headers=["*"],  # Content-Type, Authorization, etc
 )
 
 # Deep agent routes: /api/mailbills/interpret AND /api/mailbills/translate-pdf
@@ -44,16 +42,14 @@ FILE_NONE = File(default=None)
 # -------------------------------------------------------------------------
 # Shared upload helpers (OCR endpoints)
 # -------------------------------------------------------------------------
-
-
 async def _coerce_upload_file(
     request: Request,
     file: Optional[UploadFile],
 ) -> UploadFile:
     """
     Accept either:
-      1) multipart UploadFile (FormData field "file")
-      2) raw body upload (Content-Type: application/pdf, image/*, etc)
+    1) multipart UploadFile (FormData field "file")
+    2) raw body upload (Content-Type: application/pdf, image/*, etc)
     """
     if file is not None:
         return file
@@ -96,10 +92,8 @@ async def _run_pipeline(file: UploadFile) -> JSONResponse:
 
 
 # -------------------------------------------------------------------------
-# /api/mailbills/parse  (OCR only)
+# /api/mailbills/parse (OCR only)
 # -------------------------------------------------------------------------
-
-
 @app.get("/api/mailbills/parse")
 async def mailbills_parse_alive() -> JSONResponse:
     return JSONResponse(
@@ -127,8 +121,6 @@ async def mailbills_parse(
 # -------------------------------------------------------------------------
 # /api/ocr-debug
 # -------------------------------------------------------------------------
-
-
 @app.get("/api/ocr-debug")
 async def ocr_debug_alive() -> JSONResponse:
     return JSONResponse(
@@ -154,9 +146,8 @@ async def ocr_debug(
 
 
 # -------------------------------------------------------------------------
-# /api/translate  (text translation proxy used by site + Azure Functions)
+# /api/translate (text translation proxy used by site + Azure Functions)
 # -------------------------------------------------------------------------
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
@@ -199,6 +190,7 @@ async def _call_openai_translate(payload: TranslateRequest) -> str:
     )
 
     target = payload.target_lang.strip().lower()
+
     # Friendly labels for common languages; otherwise just pass the code through.
     if target.startswith("es"):
         target_label = "Spanish"
@@ -249,16 +241,16 @@ async def _call_openai_translate(payload: TranslateRequest) -> str:
             json=req_json,
         )
 
-    if resp.status_code >= 300:
-        raise RuntimeError(
-            f"OpenAI translate error {resp.status_code}: {resp.text[:500]}"
-        )
+        if resp.status_code >= 300:
+            raise RuntimeError(
+                f"OpenAI translate error {resp.status_code}: {resp.text[:500]}"
+            )
 
-    data = resp.json()
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Unexpected OpenAI translate response: {exc}") from exc
+        data = resp.json()
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Unexpected OpenAI translate response: {exc}") from exc
 
     return content.strip()
 
@@ -267,7 +259,6 @@ async def _call_openai_translate(payload: TranslateRequest) -> str:
 async def translate_text(req: TranslateRequest) -> TranslateResponse:
     """
     Simple translation endpoint.
-
     Contract:
       Request JSON: { "text": "...", "target_lang": "es", "source_lang": "auto" }
       Response JSON: { "ok": true, "translated_text": "...", "translation": "..." }
@@ -288,3 +279,158 @@ async def translate_text(req: TranslateRequest) -> TranslateResponse:
         target_lang=req.target_lang,
         source_lang=req.source_lang,
     )
+
+
+# -------------------------------------------------------------------------
+# /api/assistant (NEW: Chatbot endpoint - Mode 1 & Mode 2)
+# -------------------------------------------------------------------------
+class DocumentContext(BaseModel):
+    """Optional document context for Mode 2 (document-aware responses)"""
+    summary: str = Field("", description="Brief summary of the uploaded document")
+    document_type: str = Field("unknown", description="Type of document (bill, letter, contract, etc.)")
+    uploaded_at: str = Field("", description="ISO timestamp when document was uploaded")
+
+
+class AssistantRequest(BaseModel):
+    message: str = Field(..., min_length=1, description="User's question")
+    lang: str = Field("en", description="Language code: 'en' or 'es'")
+    document_context: Optional[DocumentContext] = Field(
+        None, 
+        description="Optional: context from recently uploaded document for document-aware responses"
+    )
+
+
+class AssistantResponse(BaseModel):
+    reply: str = Field(..., description="Assistant's response")
+    mode: str = Field("general", description="Response mode: 'general' or 'document-aware'")
+
+
+async def _call_openai_assistant(
+    message: str, 
+    lang: str, 
+    doc_context: Optional[DocumentContext]
+) -> Dict[str, Any]:
+    """
+    Call OpenAI for assistant responses.
+    
+    Mode 1 (General): No document context - answers site questions
+    Mode 2 (Document-aware): Has document context - can answer document-specific questions
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured in the environment.")
+
+    # Build system prompt based on mode
+    if doc_context and doc_context.summary:
+        # Mode 2: Document-aware
+        system_prompt = (
+            "You are a helpful assistant for Voyadecir, a service that helps people understand "
+            "documents, bills, and letters in multiple languages.\n\n"
+            "The user recently uploaded a document. Here's what we know about it:\n"
+            f"- Type: {doc_context.document_type}\n"
+            f"- Summary: {doc_context.summary}\n"
+            f"- Uploaded: {doc_context.uploaded_at}\n\n"
+            "You can answer questions about:\n"
+            "1. This specific document (amounts, dates, what to do next, consequences, etc.)\n"
+            "2. General questions about using Voyadecir\n\n"
+            "Rules:\n"
+            "- Be concise and helpful (2-4 sentences max)\n"
+            "- If asked about the document, reference specific details from the summary\n"
+            "- If asked about site features, explain clearly\n"
+            "- Be empathetic - documents can be stressful for non-native speakers\n"
+            f"- Respond in {'Spanish' if lang == 'es' else 'English'}\n"
+        )
+        mode = "document-aware"
+    else:
+        # Mode 1: General help
+        system_prompt = (
+            "You are a helpful assistant for Voyadecir, a service that helps people understand "
+            "documents, bills, and letters in multiple languages.\n\n"
+            "You can help with:\n"
+            "- How to upload documents (PDFs, images)\n"
+            "- What languages are supported (English, Spanish, Portuguese, French, Chinese, Hindi, Arabic, Bengali, Russian, Urdu)\n"
+            "- Privacy and security questions\n"
+            "- Pricing ($8/month for unlimited, 2-3 free scans/month)\n"
+            "- How OCR and translation work\n\n"
+            "Rules:\n"
+            "- Be concise and friendly (2-4 sentences max)\n"
+            "- If you don't know something specific, be honest\n"
+            "- Encourage users to try the Mail & Bills Helper for document scanning\n"
+            f"- Respond in {'Spanish' if lang == 'es' else 'English'}\n"
+        )
+        mode = "general"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": message},
+    ]
+
+    req_json = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0.7,  # Slightly higher for conversational responses
+        "max_tokens": 200,  # Keep responses concise
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=req_json,
+        )
+
+        if resp.status_code >= 300:
+            raise RuntimeError(
+                f"OpenAI assistant error {resp.status_code}: {resp.text[:500]}"
+            )
+
+        data = resp.json()
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Unexpected OpenAI assistant response: {exc}") from exc
+
+    return {
+        "reply": content.strip(),
+        "mode": mode
+    }
+
+
+@app.post("/api/assistant", response_model=AssistantResponse)
+async def assistant_chat(req: AssistantRequest) -> AssistantResponse:
+    """
+    Chatbot assistant endpoint.
+    
+    Mode 1 (General): Answers questions about site features, uploading, languages, pricing
+    Mode 2 (Document-aware): Can answer questions about a specific uploaded document
+    
+    Cost: ~$0.0001-0.0003 per conversation (gpt-4o-mini)
+    """
+    try:
+        result = await _call_openai_assistant(
+            message=req.message,
+            lang=req.lang,
+            doc_context=req.document_context
+        )
+        
+        logger.info(
+            "Assistant response: mode=%s lang=%s has_doc_context=%s",
+            result["mode"],
+            req.lang,
+            bool(req.document_context)
+        )
+        
+        return AssistantResponse(
+            reply=result["reply"],
+            mode=result["mode"]
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Assistant failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "message": str(exc)},
+        ) from exc
