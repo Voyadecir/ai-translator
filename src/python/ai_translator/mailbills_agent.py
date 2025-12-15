@@ -47,10 +47,40 @@ class MailBillsAgent:
     def __init__(self):
         """Initialize Azure services and GPT clients."""
         # Azure Document Intelligence (OCR)
-        self.doc_intel_client = DocumentIntelligenceClient(
-            endpoint=os.getenv("AZURE_DOC_INTEL_ENDPOINT"),
-            credential=AzureKeyCredential(os.getenv("AZURE_DOC_INTEL_KEY")),
+        #
+        # Deployment environments use a few different names for the OCR service
+        # endpoint and key.  Prefer the DOCINTEL variants (without underscores)
+        # and fall back to the DI_* variables if present.  If neither is
+        # available, do not instantiate the client (leaving it as ``None``) and
+        # log a warning instead of raising a TypeError.  This prevents the
+        # missing credentials from crashing the application at import time.
+        di_endpoint = (
+            os.getenv("AZURE_DOCINTEL_ENDPOINT")
+            or os.getenv("AZURE_DI_ENDPOINT")
+            or os.getenv("AZURE_DOC_INTEL_ENDPOINT")
         )
+        di_key = (
+            os.getenv("AZURE_DOCINTEL_KEY")
+            or os.getenv("AZURE_DI_API_KEY")
+            or os.getenv("AZURE_DOC_INTEL_KEY")
+        )
+        if di_endpoint and di_key:
+            try:
+                self.doc_intel_client = DocumentIntelligenceClient(
+                    endpoint=di_endpoint,
+                    credential=AzureKeyCredential(di_key),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize Document Intelligence client: {e}")
+                self.doc_intel_client = None
+        else:
+            # If credentials are missing, set the client to None and warn.  OCR
+            # will fail if attempted, but this avoids raising a TypeError on
+            # import when the key is None.
+            self.doc_intel_client = None
+            logger.warning(
+                "Azure Document Intelligence credentials are not set; OCR may not work."
+            )
 
         # Initialize OpenAI client with fallback to standard API
         azure_key = os.getenv("AZURE_OPENAI_API_KEY")
