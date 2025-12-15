@@ -17,6 +17,10 @@ import os
 import openai
 from openai import AzureOpenAI
 
+# FastAPI routing utilities for exposing endpoints
+from fastapi import APIRouter, UploadFile, File, Query
+from fastapi.responses import JSONResponse
+
 # Azure clients
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
@@ -416,6 +420,76 @@ class MailBillsAgent:
 # GLOBAL INSTANCE
 # =====================================================================
 mailbills_agent = MailBillsAgent()
+
+# ---------------------------------------------------------------------
+# API Router for Mail & Bills Agent
+#
+# Define FastAPI routes so this module can be included in the top-level
+# application via ``app.include_router(mailbills_router, prefix="/api")``.
+# The endpoints mirror the high-level functions provided by the
+# MailBillsAgent class.  They are defined as async handlers to allow
+# proper integration with FastAPI's asynchronous request handling.
+
+# Create a router instance for this module.  The router exposes two
+# endpoints:
+#   - GET /mailbills/interpret: health/alive check
+#   - POST /mailbills/interpret: run the document OCR + translation pipeline
+# Additional endpoints could be added here (e.g. PDF translation or sources).
+router = APIRouter()
+
+@router.get("/mailbills/interpret")
+async def mailbills_interpret_alive() -> JSONResponse:
+    """Alive endpoint for the interpreter."""
+    return JSONResponse(
+        status_code=200,
+        content={"ok": True, "message": "mailbills/interpret alive"},
+    )
+
+
+@router.post("/mailbills/interpret")
+async def mailbills_interpret(
+    file: UploadFile = File(...),
+    source_lang: str = Query('en', description="Source language code"),
+    target_lang: str = Query('es', description="Target language code"),
+) -> JSONResponse:
+    """
+    Interpret and translate a scanned document.
+
+    Expects a file upload (PDF or image).  Reads the bytes, runs the
+    OCR+translation pipeline, and returns the full result.  If any
+    exception occurs, a 500 response is returned with an error message.
+    """
+    try:
+        # Read the uploaded file into bytes
+        file_bytes = await file.read()
+        # Process the document via the global agent
+        result = mailbills_agent.process_document(
+            file_bytes,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            user_preferences=None,
+        )
+        return JSONResponse(status_code=200, content={"ok": True, **result})
+    except Exception as exc:
+        logger.exception("mailbills interpret failed: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(exc)},
+        )
+
+
+@router.get("/mailbills/authoritative-sources")
+async def list_authoritative_sources() -> JSONResponse:
+    """List the authoritative dictionary sources used by the service."""
+    try:
+        sources = mailbills_agent.get_authoritative_sources()
+        return JSONResponse(status_code=200, content={"ok": True, "sources": sources})
+    except Exception as exc:
+        logger.exception("Failed to list authoritative sources: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(exc)},
+        )
 
 
 def process_document(
