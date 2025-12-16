@@ -1,226 +1,286 @@
-from __future__ import annotations
-import os
-import sys
-import json
-import time
-from pathlib import Path
-from dotenv import load_dotenv
-from rich import print
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
+/* =========================================================
+   Voyadecir main.js
+   - Language menu (global)
+   - "More" dropdown (global)
+   - Minimal i18n engine (data-i18n)
+   - Emits: window.dispatchEvent(new CustomEvent("voyadecir:lang-changed", {detail:{lang}}))
+   ========================================================= */
 
-from ai_translator.utils.health import check_health, Health
-from ai_translator.utils.circuit import CircuitBreaker
-from ai_translator.utils.cache import get_cache, save_json, load_json
-from ai_translator.pdf.convert import pdf_to_pngs
-from ai_translator.ocr.engine import ocr_image
-from ai_translator.translate.client import (
-    translate_text,
-    TranslationConfig,
-    TransientHTTPError,
-)
+(function () {
+  "use strict";
 
+  const STORAGE_KEY = "voyadecir_lang";
 
-# ---------- Load environment ----------
-load_dotenv()
+  // Keep these aligned with your UI list
+  const SUPPORTED_LANGS = [
+    { code: "en", label: "English" },
+    { code: "es", label: "Español" },
+    { code: "pt", label: "Português" },
+    { code: "fr", label: "Français" },
+    { code: "zh", label: "中文" },
+    { code: "hi", label: "हिन्दी" },
+    { code: "ar", label: "العربية" },
+    { code: "bn", label: "বাংলা" },
+    { code: "ur", label: "اردو" },
+    { code: "py", label: "Guaraní" }, // keeping your existing list entry
+  ];
 
-PDF_DIR = Path(os.getenv("PDF_DIR", "pdfs"))
-OUT_DIR = Path(os.getenv("OUT_DIR", "output"))
-OUT_DIR.mkdir(exist_ok=True, parents=True)
+  // Minimal UI strings. Expand as we tag elements with data-i18n.
+  // Fallback is English if a key is missing in selected language.
+  const I18N = {
+    en: {
+      "nav.home": "Home",
+      "nav.translate": "Translate",
+      "nav.mailbills": "Mail & Bills",
+      "nav.more": "More",
+      "nav.about": "About",
+      "nav.contact": "Contact",
+      "nav.privacy": "Privacy",
+      "nav.terms": "Terms",
 
-# ---------- Circuit breakers ----------
-ocr_cb = CircuitBreaker(failure_threshold=2, reset_timeout=60)
-translate_cb = CircuitBreaker(failure_threshold=2, reset_timeout=60)
+      "translate.title": "Translate",
+      "translate.subtitle":
+        "Paste text to translate. Voyadecir is designed to translate with context, and can provide multiple meanings when needed.",
+      "translate.btn.translate": "Translate",
+      "translate.btn.clear": "Clear",
 
-# ---------- Metrics ----------
-METRICS = {
-    "processed": 0,
-    "ocr_cb": "CLOSED",
-    "translate_cb": "CLOSED",
-    "offline_mode_used": False,
-}
-METRICS_PATH = Path("metrics.json")
+      "translate.from": "From",
+      "translate.to": "To",
+      "translate.from.auto": "Auto",
 
+      "translate.placeholder.input": "Type or paste text here…",
+      "translate.placeholder.output": "Translation will appear here…",
 
-# ---------- Error Classes ----------
-class PdfConvertError(Exception):
-    """Raised when PDF→PNG conversion fails."""
+      "clara.title": "Clara, your Assistant",
+      "clara.placeholder": "Ask me about Voyadecir…",
+      "clara.send": "Send",
+    },
+    es: {
+      "nav.home": "Inicio",
+      "nav.translate": "Traducir",
+      "nav.mailbills": "Correo y Facturas",
+      "nav.more": "Más",
+      "nav.about": "Acerca de",
+      "nav.contact": "Contacto",
+      "nav.privacy": "Privacidad",
+      "nav.terms": "Términos",
 
-    pass
+      "translate.title": "Traducir",
+      "translate.subtitle":
+        "Pega texto para traducir. Voyadecir está diseñado para traducir con contexto y puede dar varios significados cuando sea necesario.",
+      "translate.btn.translate": "Traducir",
+      "translate.btn.clear": "Borrar",
 
+      "translate.from": "De",
+      "translate.to": "A",
+      "translate.from.auto": "Auto",
 
-class OcrError(Exception):
-    """Raised when OCR processing fails."""
+      "translate.placeholder.input": "Escribe o pega texto aquí…",
+      "translate.placeholder.output": "La traducción aparecerá aquí…",
 
-    pass
+      "clara.title": "Clara, tu Asistente",
+      "clara.placeholder": "Pregúntame sobre Voyadecir…",
+      "clara.send": "Enviar",
+    },
+    pt: {
+      "nav.home": "Início",
+      "nav.translate": "Traduzir",
+      "nav.mailbills": "Correio e Contas",
+      "nav.more": "Mais",
+      "nav.about": "Sobre",
+      "nav.contact": "Contato",
+      "nav.privacy": "Privacidade",
+      "nav.terms": "Termos",
 
+      "translate.title": "Traduzir",
+      "translate.subtitle":
+        "Cole texto para traduzir. O Voyadecir foi feito para traduzir com contexto e pode oferecer vários significados quando necessário.",
+      "translate.btn.translate": "Traduzir",
+      "translate.btn.clear": "Limpar",
 
-class TranslateError(Exception):
-    """Raised when translation fails."""
+      "translate.from": "De",
+      "translate.to": "Para",
+      "translate.from.auto": "Auto",
 
-    pass
+      "translate.placeholder.input": "Digite ou cole o texto aqui…",
+      "translate.placeholder.output": "A tradução aparecerá aqui…",
 
+      "clara.title": "Clara, sua Assistente",
+      "clara.placeholder": "Pergunte sobre o Voyadecir…",
+      "clara.send": "Enviar",
+    },
+  };
 
-# ---------- Resilient wrappers ----------
-@retry(
-    stop=stop_after_attempt(int(os.getenv("MAX_RETRIES", "3"))),
-    wait=wait_exponential(multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "1")), max=10),
-    retry=retry_if_exception_type(PdfConvertError),
-    reraise=True,
-)
-def safe_pdf_to_pngs(pdf_path: Path, out_dir: Path, pdftoppm: str):
-    """Safely converts a PDF into PNG images with retry handling."""
-    try:
-        return pdf_to_pngs(pdf_path, out_dir, pdftoppm)
-    except Exception as e:
-        raise PdfConvertError(str(e))
+  function detectBrowserLang() {
+    const raw = (navigator.language || "en").toLowerCase();
+    const code = raw.split("-")[0];
+    return SUPPORTED_LANGS.some((l) => l.code === code) ? code : "en";
+  }
 
+  function getLang() {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored && SUPPORTED_LANGS.some((l) => l.code === stored)) return stored;
+    return detectBrowserLang();
+  }
 
-@retry(
-    stop=stop_after_attempt(int(os.getenv("MAX_RETRIES", "3"))),
-    wait=wait_exponential(multiplier=float(os.getenv("RETRY_BACKOFF_SECONDS", "1")), max=10),
-    retry=retry_if_exception_type(OcrError),
-    reraise=True,
-)
-def safe_ocr_image(img: Path, tess: str, lang: str):
-    """Safely performs OCR with retry handling."""
-    try:
-        return ocr_image(img, tess, lang)
-    except Exception as e:
-        raise OcrError(str(e))
+  function setLang(code) {
+    const finalCode = SUPPORTED_LANGS.some((l) => l.code === code) ? code : "en";
+    localStorage.setItem(STORAGE_KEY, finalCode);
+    document.documentElement.setAttribute("lang", finalCode);
 
+    applyI18n(finalCode);
+    updateLangButtonLabel(finalCode);
 
-# ---------- Dashboard ----------
-def dump_dashboard():
-    """Standardized metrics schema for tests and monitoring."""
-    metrics = {
-        "processed": METRICS.get("processed", 0),
-        "ocr_cb": ocr_cb.state,
-        "translate_cb": translate_cb.state,
-        "offline_mode_used": (
-            os.getenv("OFFLINE_MODE", "false").lower() == "true" or not os.getenv("OPENAI_API_KEY")
-        ),
-        "last_run_at": time.time(),
-    }
+    window.dispatchEvent(
+      new CustomEvent("voyadecir:lang-changed", { detail: { lang: finalCode } })
+    );
+  }
 
-    METRICS_PATH.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+  function t(lang, key) {
+    const pack = I18N[lang] || I18N.en;
+    return (pack && pack[key]) || (I18N.en && I18N.en[key]) || key;
+  }
 
-    print("\n[bold green]===== DASHBOARD =====[/bold green]")
-    print(json.dumps(metrics, indent=2))
-    print("[bold green]=====================[/bold green]\n")
+  function applyI18n(lang) {
+    // Text nodes
+    document.querySelectorAll("[data-i18n]").forEach((el) => {
+      const key = el.getAttribute("data-i18n");
+      if (!key) return;
+      el.textContent = t(lang, key);
+    });
 
+    // Placeholders
+    document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+      const key = el.getAttribute("data-i18n-placeholder");
+      if (!key) return;
+      el.setAttribute("placeholder", t(lang, key));
+    });
 
-# ---------- Main entry ----------
-def main():
-    """Main pipeline: PDF → OCR → Translate → Output."""
-    h: Health = check_health()
+    // Button values (input type=button/submit)
+    document.querySelectorAll("[data-i18n-value]").forEach((el) => {
+      const key = el.getAttribute("data-i18n-value");
+      if (!key) return;
+      el.setAttribute("value", t(lang, key));
+    });
 
-    # Health summary
-    print(f"🔍 Health: tesseract = {h.tesseract_path or '❌ Not found'}")
-    print(f"🔍 Health: poppler = {h.poppler_path or '❌ Not found'}")
-    print(f"🔍 Health: ImageMagick = {h.magick_path or '❌ Not found'}")
-    print(f"🌐 Internet: {'OK' if h.internet_ok else 'OFFLINE'}")
-    print(f"🔑 API key present: {'Yes' if h.openai_key_present else 'No'}")
+    // Optional: document title
+    const titleKey = document.body.getAttribute("data-i18n-title");
+    if (titleKey) document.title = t(lang, titleKey);
+  }
 
-    target_lang = os.getenv("TARGET_LANG") or ""
-    if not target_lang:
-        print("ℹ️  Translation disabled (no TARGET_LANG in .env).")
-    else:
-        print(f"🌐 Target language: {target_lang}")
+  function updateLangButtonLabel(lang) {
+    const btn = document.querySelector(".lang-menu__button");
+    if (!btn) return;
 
-    # Input PDFs
-    pdfs = sorted(PDF_DIR.glob("*.pdf"))
-    if not pdfs:
-        print(f"ℹ️  No PDFs found in {PDF_DIR.resolve()}. Place files and run again.")
-        dump_dashboard()
-        return
+    const codeBadge = btn.querySelector("[data-lang-badge]");
+    if (codeBadge) codeBadge.textContent = (lang || "en").toUpperCase();
+  }
 
-    for pdf in pdfs:
-        print(f"\n📄 Processing: {pdf.name}")
-        out_text_path = OUT_DIR / f"{pdf.stem}.txt"
-        cache_key = {"pdf": str(pdf), "tess": bool(h.tesseract_path)}
-        cache_file = get_cache("ocr", cache_key)
-        cached = load_json(cache_file)
+  // ---------------------------
+  // Language menu behavior
+  // ---------------------------
+  function initLanguageMenu() {
+    const menu = document.querySelector(".lang-menu");
+    const btn = document.querySelector(".lang-menu__button");
+    const list = document.querySelector(".lang-menu__list");
 
-        ocr_text_all = ""
-        imgs: list[Path] = []
+    if (!menu || !btn || !list) return;
 
-        # PDF → images
-        if h.poppler_path:
-            try:
-                imgs = safe_pdf_to_pngs(pdf, OUT_DIR / "images", h.poppler_path)
-            except Exception as e:
-                print(f"❌ PDF→PNG failed: {e}. Using cached OCR if available.")
-        else:
-            print("🟡 No pdftoppm found — skipping image conversion.")
+    // Ensure list has buttons hooked
+    list.querySelectorAll("[data-lang]").forEach((item) => {
+      item.addEventListener("click", () => {
+        const code = item.getAttribute("data-lang");
+        setLang(code);
 
-        # OCR processing
-        if imgs and h.tesseract_path:
-            if not ocr_cb.allow():
-                print("🟡 OCR circuit OPEN — using cached OCR if available.")
-                if cached and "text" in cached:
-                    ocr_text_all = cached["text"]
-            else:
-                try:
-                    for img in imgs:
-                        txt = safe_ocr_image(img, h.tesseract_path, os.getenv("OCR_LANG", "eng"))
-                        ocr_text_all += txt + "\n"
-                    ocr_cb.record_success()
-                except Exception as e:
-                    print(f"❌ OCR error: {e}")
-                    ocr_cb.record_failure()
-                    if cached and "text" in cached:
-                        ocr_text_all = cached["text"]
-        else:
-            # fallback to cached OCR
-            if cached and "text" in cached:
-                ocr_text_all = cached["text"]
-            else:
-                print("ℹ️  No OCR results available; continuing with empty text.")
+        // close after select
+        btn.setAttribute("aria-expanded", "false");
+        menu.classList.remove("is-open");
+      });
+    });
 
-        out_text_path.write_text(ocr_text_all, encoding="utf-8")
-        save_json(cache_file, {"text": ocr_text_all})
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
 
-        # Translation step
-        if target_lang:
-            if not translate_cb.allow():
-                print("🟡 Translate circuit OPEN — skipping translation.")
-            else:
-                try:
-                    cfg = TranslationConfig(
-                        target_lang=target_lang,
-                        timeout=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30")),
-                    )
-                    chunks = [c for c in ocr_text_all.split("\n\n") if c.strip()]
-                    translated = []
-                    for c in chunks:
-                        try:
-                            translated.append(translate_text(c, cfg))
-                        except TransientHTTPError as te:
-                            print(f"⚠️ Transient translation error (chunk): {te}")
-                            translated.append(f"[{cfg.target_lang}] {c}")
-                    (OUT_DIR / f"{pdf.stem}.translated.{target_lang}.txt").write_text(
-                        "\n\n".join(translated),
-                        encoding="utf-8",
-                    )
-                    translate_cb.record_success()
-                except Exception as e:
-                    print(f"❌ Translate error: {e}")
-                    translate_cb.record_failure()
+      const expanded = btn.getAttribute("aria-expanded") === "true";
+      btn.setAttribute("aria-expanded", expanded ? "false" : "true");
+      menu.classList.toggle("is-open", !expanded);
+    });
 
-        METRICS["processed"] += 1
+    // click outside closes
+    document.addEventListener("click", () => {
+      btn.setAttribute("aria-expanded", "false");
+      menu.classList.remove("is-open");
+    });
 
-    dump_dashboard()
-    print("🎉 Done.")
+    // prevent inside clicks from closing
+    menu.addEventListener("click", (e) => e.stopPropagation());
+  }
 
+  // ---------------------------
+  // "More" dropdown behavior
+  // ---------------------------
+  function initMoreMenu() {
+    const btn = document.querySelector(".nav-more__button");
+    const list = document.querySelector(".nav-more__list");
+    if (!btn || !list) return;
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[red]Fatal error:[/red] {e}")
-        sys.exit(1)
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const expanded = btn.getAttribute("aria-expanded") === "true";
+      btn.setAttribute("aria-expanded", expanded ? "false" : "true");
+    });
+
+    // click outside closes
+    document.addEventListener("click", () => {
+      btn.setAttribute("aria-expanded", "false");
+    });
+
+    // prevent clicks inside
+    list.addEventListener("click", (e) => e.stopPropagation());
+  }
+
+  // ---------------------------
+  // Glass SVG filter injection (safe)
+  // ---------------------------
+  function ensureGlassFilter() {
+    if (document.getElementById("lg-dist")) return;
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("style", "display:none");
+
+    svg.innerHTML = `
+      <filter id="lg-dist" x="0%" y="0%" width="100%" height="100%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.008 0.008" numOctaves="2" seed="92" result="noise" />
+        <feGaussianBlur in="noise" stdDeviation="2" result="blurred" />
+        <feDisplacementMap in="SourceGraphic" in2="blurred" scale="70" xChannelSelector="R" yChannelSelector="G" />
+      </filter>
+    `;
+
+    document.body.appendChild(svg);
+  }
+
+  // ---------------------------
+  // Boot
+  // ---------------------------
+  function boot() {
+    ensureGlassFilter();
+    initLanguageMenu();
+    initMoreMenu();
+
+    const lang = getLang();
+    setLang(lang);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+
+  // Public access (for other scripts)
+  window.Voyadecir = window.Voyadecir || {};
+  window.Voyadecir.getLang = getLang;
+  window.Voyadecir.setLang = setLang;
+})();
