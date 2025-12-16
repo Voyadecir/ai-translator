@@ -1,5 +1,7 @@
 import os
+import datetime
 import logging
+import re
 from io import BytesIO
 from typing import Optional, Dict, Any
 import httpx
@@ -21,6 +23,47 @@ from .utils.sarcasm_tone_detector import sarcasm_detector
 from .utils.context_handler import context_handler
 
 logging.basicConfig(level=logging.INFO)
+
+# -------------------------------------------------------------------------
+# Lightweight language detection (heuristic, no extra deps)
+# -------------------------------------------------------------------------
+def _detect_source_lang(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return "en"
+
+    # Unicode script hints
+    for ch in s:
+        o = ord(ch)
+        if 0x0600 <= o <= 0x06FF:  # Arabic
+            return "ar"
+        if 0x0900 <= o <= 0x097F:  # Devanagari
+            return "hi"
+        if 0x0980 <= o <= 0x09FF:  # Bengali
+            return "bn"
+        if 0x4E00 <= o <= 0x9FFF:  # CJK
+            return "zh"
+        if 0x0400 <= o <= 0x04FF:  # Cyrillic
+            return "ru"
+
+    # Stopword heuristic for Latin scripts
+    low = re.sub(r"[^a-záéíóúüñçàèùâêîôûãõ\s]", " ", s.lower())
+    tokens = low.split()
+    if not tokens:
+        return "en"
+
+    def score(words):
+        wset=set(words)
+        return sum(1 for t in tokens if t in wset)
+
+    es = score(["el","la","de","que","y","en","los","del","por","para","una","un","no","es","con","como","más","pero","si","porque","hola"])
+    pt = score(["o","a","de","que","e","em","os","do","da","para","uma","um","não","com","como","mais","mas","se","porque","olá"])
+    fr = score(["le","la","de","et","les","des","en","un","une","pour","pas","avec","comme","plus","mais","si","bonjour"])
+    en = score(["the","and","to","of","in","is","it","for","on","with","as","this","that","hello","not"])
+
+    best = max([("es",es),("pt",pt),("fr",fr),("en",en)], key=lambda x: x[1])
+    return best[0] if best[1] >= 2 else "en"
+
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------------
@@ -179,7 +222,7 @@ async def translate_text_endpoint(req: TranslateRequest) -> TranslateResponse:
         # Use File 16 (translation_engine) for full intelligence
         result = translate_with_intelligence(
             text=req.text,
-            source_lang=req.source_lang if req.source_lang != "auto" else "en",
+            source_lang=req.source_lang if req.source_lang != "auto" else _detect_source_lang(req.text),
             target_lang=req.target_lang
         )
         
@@ -219,7 +262,7 @@ class DocumentContext(BaseModel):
 
 class AssistantRequest(BaseModel):
     message: str = Field(..., min_length=1, description="User's question")
-    lang: str = Field("en", description="Language code: 'en' or 'es'")
+    lang: str = Field("en", description="Language code (e.g. en, es, pt, fr, zh, hi, ar, bn, ru, ur)")
     document_context: Optional[DocumentContext] = Field(
         None, 
         description="Optional document context"
@@ -232,6 +275,24 @@ class AssistantResponse(BaseModel):
     enrichment: Optional[Dict] = None  # NEW: Intelligence data
     suggestions: Optional[list] = None  # NEW: Suggested follow-up questions
 
+
+
+async def _ensure_lang_reply(reply: str, lang: str) -> str:
+    if not reply:
+        return reply
+    lang = (lang or "en").strip().lower()
+    if lang in ("en","auto"):
+        return reply
+    try:
+        # Translate helper response text into the requested language
+        translated = translate_with_intelligence(
+            text=reply,
+            source_lang="en",
+            target_lang=lang
+        )
+        return translated.get("translated_text") or translated.get("translation") or reply
+    except Exception:
+        return reply
 
 async def _intelligent_assistant(
     message: str, 
@@ -422,7 +483,7 @@ async def assistant_chat(req: AssistantRequest) -> AssistantResponse:
         )
         
         return AssistantResponse(
-            reply=result["reply"],
+            reply=await _ensure_lang_reply(result["reply"], req.lang),
             mode=result["mode"],
             enrichment=result.get("enrichment"),
             suggestions=result.get("suggestions")
@@ -498,3 +559,43 @@ async def test_intelligence() -> JSONResponse:
                 "message": "Some intelligence systems failed to load"
             }
         )
+
+
+
+# -------------------------------------------------------------------------
+# /api/support  (Create a lightweight support ticket)
+# -------------------------------------------------------------------------
+class SupportRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    lang: str = Field("en")
+    page: str = Field("", description="Client page path")
+    userAgent: str = Field("", description="Client user agent")
+
+class SupportResponse(BaseModel):
+    ticket_id: str
+    ok: bool = True
+
+@app.post("/api/support", response_model=SupportResponse)
+async def create_support_ticket(req: SupportRequest, request: Request) -> SupportResponse:
+    """Create a support ticket. If SUPPORT_FORM_URL is set, forward to it."""
+    ticket_id = f"VD-{int(datetime.datetime.utcnow().timestamp())}"
+    payload = {
+        "ticket_id": ticket_id,
+        "message": req.message,
+        "lang": req.lang,
+        "page": req.page,
+        "userAgent": req.userAgent,
+        "ip": request.client.host if request.client else "",
+        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+    logger.info("[support] %s", payload)
+
+    form_url = os.getenv("SUPPORT_FORM_URL", "").strip()
+    if form_url:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(form_url, json=payload)
+        except Exception as exc:
+            logger.warning("Support forward failed: %s", exc)
+
+    return SupportResponse(ticket_id=ticket_id, ok=True)
