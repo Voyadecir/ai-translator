@@ -17,5 +17,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-ENV PORT=8000
+# IMPORTANT: Do NOT hardcode PORT in Dockerfile. Render injects $PORT.
 CMD ["sh", "-c", "uvicorn ai_translator.api:app --host 0.0.0.0 --port ${PORT:-8000}"]
