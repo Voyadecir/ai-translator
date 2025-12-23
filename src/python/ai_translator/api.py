@@ -19,6 +19,7 @@ from .pdf_utils import build_translated_pdf_bytes
 # Import cultural intelligence systems
 from .utils.ui_translation import ui_translator
 from .utils.translation_engine import translate_text as translate_with_intelligence
+from .utils.language_detector import detect_language
 from .utils.idiom_database import idiom_db
 from .utils.profanity_handler import profanity_handler
 from .utils.sarcasm_tone_detector import sarcasm_detector
@@ -165,6 +166,8 @@ class TranslateResponse(BaseModel):
     translation: str
     target_lang: str
     source_lang: str
+    detected_source_lang: Optional[str] = None
+    detection_confidence: Optional[float] = None
     enrichment: Optional[Dict] = None
     warnings: Optional[list] = None
 
@@ -172,9 +175,14 @@ class TranslateResponse(BaseModel):
 @app.post("/api/translate", response_model=TranslateResponse)
 async def translate_text_endpoint(req: TranslateRequest) -> TranslateResponse:
     try:
+        detected_lang = req.source_lang
+        detection_confidence: Optional[float] = None
+        if req.source_lang == "auto":
+            detected_lang, detection_confidence = detect_language(req.text, fallback="en")
+
         result = translate_with_intelligence(
             text=req.text,
-            source_lang=req.source_lang if req.source_lang != "auto" else "en",
+            source_lang=detected_lang if detected_lang else "en",
             target_lang=req.target_lang
         )
 
@@ -190,7 +198,9 @@ async def translate_text_endpoint(req: TranslateRequest) -> TranslateResponse:
             translated_text=result['translated_text'],
             translation=result['translated_text'],
             target_lang=req.target_lang,
-            source_lang=req.source_lang,
+            source_lang=detected_lang or req.source_lang,
+            detected_source_lang=detected_lang,
+            detection_confidence=detection_confidence,
             enrichment=result['enrichment'],
             warnings=result['warnings']
         )
@@ -207,8 +217,10 @@ async def translate_text_endpoint(req: TranslateRequest) -> TranslateResponse:
 # -------------------------------------------------------------------------
 @app.post("/api/mailbills/translate-pdf")
 async def mailbills_translate_pdf(
-    files: List[UploadFile] = File(...),
+    request: Request,
+    files: Optional[List[UploadFile]] = File(default=None),
     target_lang: str = Form("es"),
+    source_lang: str = Form("auto"),
     translation_style: str = Form("professional"),
 ) -> Response:
     """
@@ -219,30 +231,50 @@ async def mailbills_translate_pdf(
       - Content-Type: application/pdf
       - binary PDF body
     """
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded.")
-
-    # 1) OCR all pages
+    content_type = request.headers.get("content-type", "")
     combined_ocr_parts: List[str] = []
     source_names: List[str] = []
 
-    for idx, f in enumerate(files, start=1):
+    if content_type.startswith("application/json"):
         try:
-            source_names.append(f.filename or f"page_{idx}")
-            status_code, body = await run_ocr_pipeline(f)
-
-            if status_code != 200:
-                logger.error("translate-pdf OCR failed: status=%s body=%s", status_code, str(body)[:500])
-                raise HTTPException(status_code=500, detail="OCR failed while generating PDF.")
-
-            raw_text = (body.get("raw_text") or "").strip()
-            if raw_text:
-                combined_ocr_parts.append(f"\n\n--- Page {idx}: {source_names[-1]} ---\n\n{raw_text}")
-        except HTTPException:
-            raise
+            data = await request.json()
         except Exception as exc:
-            logger.exception("translate-pdf OCR exception: %s", exc)
-            raise HTTPException(status_code=500, detail="OCR crashed while generating PDF.") from exc
+            logger.exception("translate-pdf JSON parse failed: %s", exc)
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+        original_text = (data.get("text") or "").strip()
+        target_lang = data.get("target_lang") or target_lang
+        source_lang = data.get("source_lang") or source_lang
+        summary_hint = (data.get("summary") or "").strip()
+
+        if not original_text:
+            raise HTTPException(status_code=422, detail="No text provided for PDF generation.")
+
+        combined_ocr_parts.append(original_text)
+        if summary_hint:
+            combined_ocr_parts.append(f"\n\n--- Summary ---\n{summary_hint}")
+        source_names.append("text")
+    else:
+        if not files:
+            raise HTTPException(status_code=400, detail="No files uploaded.")
+
+        for idx, f in enumerate(files, start=1):
+            try:
+                source_names.append(f.filename or f"page_{idx}")
+                status_code, body = await run_ocr_pipeline(f)
+
+                if status_code != 200:
+                    logger.error("translate-pdf OCR failed: status=%s body=%s", status_code, str(body)[:500])
+                    raise HTTPException(status_code=500, detail="OCR failed while generating PDF.")
+
+                raw_text = (body.get("raw_text") or "").strip()
+                if raw_text:
+                    combined_ocr_parts.append(f"\n\n--- Page {idx}: {source_names[-1]} ---\n\n{raw_text}")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.exception("translate-pdf OCR exception: %s", exc)
+                raise HTTPException(status_code=500, detail="OCR crashed while generating PDF.") from exc
 
     original_text = "\n".join(combined_ocr_parts).strip()
     if not original_text:
@@ -254,9 +286,10 @@ async def mailbills_translate_pdf(
     try:
         # translation_style is accepted from frontend, but for now we map to a consistent quality mode.
         # (You can expand later with different temps/voices.)
+        detected_lang, _ = detect_language(original_text, fallback=source_lang or "en")
         translation_result = translate_with_intelligence(
             text=original_text,
-            source_lang="en",  # best-effort; auto-detect can be added later without breaking anything
+            source_lang=detected_lang,
             target_lang=target_lang
         )
         translated_text = (translation_result.get("translated_text") or "").strip()

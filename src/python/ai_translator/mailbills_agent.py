@@ -14,6 +14,7 @@ enrichment.  The original file-upload interpretation has been moved to
 """
 
 import logging
+import re
 from typing import Dict, List, Optional
 from datetime import datetime
 import os
@@ -30,6 +31,7 @@ from pydantic import BaseModel, Field
 from .utils.ocr_preprocessor import assess_image, preprocess_for_ocr
 from .utils.ocr_postprocessor import clean_ocr_output
 from .utils.translation_engine import translate_text
+from .utils.language_detector import detect_language
 from .utils.translation_dictionaries import AUTHORITATIVE_SOURCES
 from .utils.ui_translation import ui_translator
 
@@ -55,7 +57,7 @@ class InterpretRequest(BaseModel):
     text: str = Field(..., description="The document text to interpret and translate")
     target_lang: str = Field("es", description="Target language code")
     ui_lang: str = Field("en", description="UI language code")
-    source_lang: str = Field("en", description="Source language code")
+    source_lang: str = Field("auto", description="Source language code")
 
 
 class MailBillsAgent:
@@ -340,39 +342,41 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
       - enrichment: extra information from the translation engine
     """
     try:
-        # Translate the text with cultural intelligence
+        detected_source, detection_confidence = detect_language(req.text, fallback="en")
+        source_lang = req.source_lang if req.source_lang != "auto" else detected_source
+
         translation_result = translate_text(
             text=req.text,
-            source_lang=req.source_lang or "en",
+            source_lang=source_lang or "en",
             target_lang=req.target_lang or "es",
             document_type="ocr_text",
             user_preferences=None,
         )
 
-        # For now, derive a summary by taking the first few sentences of the translation.
         translated = translation_result.get("translated_text", "")
-        summary = ""
-        if translated:
-            # Split into sentences based on punctuation; take first 2 sentences
-            parts = (
-                translated.replace("\n", " ")
-                .replace("¿", "")
-                .replace("¡", "")
-                .split(". ")
-            )
-            summary = ". ".join(parts[:2]).strip()
+        summary = _summarize_translation(translated, req.target_lang)
+
+        enrichment = translation_result.get("enrichment", {}) or {}
+        ambiguous_words = enrichment.get("ambiguous_words", [])
+        clarifications = _build_clarifications(ambiguous_words, req.ui_lang or req.target_lang)
+
+        identity_items = _extract_identity_items(req.text)
+        payment_items, other_amounts = _extract_payment_items(req.text)
 
         response = {
             "ok": True,
             "summary": summary,
-            "identity_items": [],
-            "payment_items": [],
-            "other_amounts_items": [],
-            "translated_text": translation_result.get("translated_text", ""),
+            "identity_items": identity_items,
+            "payment_items": payment_items,
+            "other_amounts_items": other_amounts,
+            "translated_text": translated,
             "confidence_score": translation_result.get("confidence_score", 0.0),
             "warnings": translation_result.get("warnings", []),
             "cultural_notes": translation_result.get("cultural_notes", []),
-            "enrichment": translation_result.get("enrichment", {}),
+            "enrichment": enrichment,
+            "clarifications": clarifications,
+            "detected_source_lang": source_lang,
+            "detection_confidence": detection_confidence,
         }
         return JSONResponse(status_code=200, content=response)
     except Exception as exc:
@@ -413,3 +417,87 @@ async def mailbills_interpret_file(
         return JSONResponse(
             status_code=500, content={"ok": False, "error": str(exc)}
         )
+# ------------------------------
+# Helpers
+# ------------------------------
+
+
+def _summarize_translation(translated: str, target_lang: str) -> str:
+    clean = (translated or "").replace("\n", " ").strip()
+    if not clean:
+        return ""
+
+    sentences = re.split(r"(?<=[\.\!\?])\s+", clean)
+    summary = " ".join(sentences[:2]).strip()
+    return summary or clean[:240]
+
+
+def _extract_identity_items(text: str) -> List[str]:
+    patterns = [
+        r"account\s*(?:number|no\.?|#)\s*[:#]?\s*([A-Za-z0-9\-]+)",
+        r"customer\s*id\s*[:#]?\s*([A-Za-z0-9\-]+)",
+        r"invoice\s*[:#]?\s*([A-Za-z0-9\-]+)",
+        r"policy\s*(?:number|no\.?|#)?\s*[:#]?\s*([A-Za-z0-9\-]+)",
+    ]
+
+    found: List[str] = []
+    lower_text = text.lower()
+    for pattern in patterns:
+        for match in re.finditer(pattern, lower_text, flags=re.IGNORECASE):
+            val = match.group(1)
+            if val and val not in found:
+                found.append(val)
+
+    # Also pick lines with obvious identifiers
+    for line in text.splitlines():
+        if any(keyword in line.lower() for keyword in ["account", "customer", "invoice", "policy"]):
+            cleaned = line.strip()
+            if cleaned and cleaned not in found:
+                found.append(cleaned)
+
+    return found[:5]
+
+
+def _extract_payment_items(text: str) -> (List[str], List[str]):
+    amounts = []
+    other_amounts: List[str] = []
+    due_dates: List[str] = []
+    currency_pattern = re.compile(r"(?:USD|US\$|\$|€|£)\s?\d[\d,]*(?:\.\d{2})?")
+    date_pattern = re.compile(r"(?:due|fecha|vence)[^\d]*(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})", re.IGNORECASE)
+
+    for line in text.splitlines():
+        amount_matches = currency_pattern.findall(line)
+        if amount_matches:
+            if any(word in line.lower() for word in ["due", "pagar", "amount due", "total", "balance"]):
+                amounts.extend(amount_matches)
+            else:
+                other_amounts.extend(amount_matches)
+
+        date_matches = date_pattern.findall(line)
+        due_dates.extend(date_matches)
+
+    payment_items: List[str] = []
+    if amounts:
+        payment_items.append("Amount due: " + ", ".join(dict.fromkeys(amounts)))
+    if due_dates:
+        payment_items.append("Due date(s): " + ", ".join(dict.fromkeys(due_dates)))
+
+    return payment_items[:5], other_amounts[:5]
+
+
+def _build_clarifications(ambiguous_words: List[str], lang: str) -> List[str]:
+    if not ambiguous_words:
+        return []
+
+    prompts = []
+    for word in ambiguous_words:
+        prompts.append(
+            {
+                "word": word,
+                "prompt": ui_translator.get_clarification_prompt(word, lang) if hasattr(ui_translator, "get_clarification_prompt") else None,
+                "question": f"Can you clarify what '{word}' refers to?",
+            }
+        )
+
+    return prompts
+
