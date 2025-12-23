@@ -6,6 +6,9 @@ pydantic>=2
 python-multipart
 tenacity
 
+# Language detection
+langdetect==1.0.9
+
 # PDF & Image Processing
 pdf2image
 Pillow
