@@ -37,7 +37,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from ai_translator import mailbills_agent
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["mailbills"])
+router = APIRouter()
 
 
 # -------------------------------------------------------------------------
