@@ -15,11 +15,13 @@ enrichment.  The original file-upload interpretation has been moved to
 
 import logging
 import re
-from typing import Dict, List, Optional
+import json
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 import os
 
 from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
@@ -342,36 +344,75 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
       - enrichment: extra information from the translation engine
     """
     try:
+        # 1) Detect source language (best-effort)
         detected_source, detection_confidence = detect_language(req.text, fallback="en")
         source_lang = req.source_lang if req.source_lang != "auto" else detected_source
 
+        # 2) Clean OCR text a bit (keeps meaning, improves structure)
+        cleaned = clean_ocr_output(req.text or "", document_type="unknown")
+        clean_text = (cleaned.get("cleaned_text") or req.text or "").strip()
+
+        # 3) Translate the full OCR text (kept for legacy UI features)
         translation_result = translate_text(
-            text=req.text,
+            text=clean_text,
             source_lang=source_lang or "en",
             target_lang=req.target_lang or "es",
             document_type="ocr_text",
             user_preferences=None,
         )
-
-        translated = translation_result.get("translated_text", "")
-        summary = _summarize_translation(translated, req.target_lang)
-
+        translated_full = translation_result.get("translated_text", "")
         enrichment = translation_result.get("enrichment", {}) or {}
         ambiguous_words = enrichment.get("ambiguous_words", [])
         clarifications = _build_clarifications(ambiguous_words, req.ui_lang or req.target_lang)
 
-        identity_items = _extract_identity_items(req.text)
-        payment_items, other_amounts = _extract_payment_items(req.text)
+        # 4) NEW: Robust extraction + summary + plain-language explanation (English first)
+        analysis = _analyze_document_english(
+            ocr_text=clean_text,
+            ui_lang=req.ui_lang or "en",
+            source_lang=source_lang or "en",
+            enrichment=enrichment,
+        )
+
+        english_summary = analysis.get("english_summary", "")
+        english_explanation = analysis.get("english_explanation", "")
+        extracted = analysis.get("extracted", {})
+        doc_type_guess = analysis.get("document_type", "unknown")
+        agent_warnings = analysis.get("warnings", [])
+
+        # 5) Mirror Spanish as a translation of the English outputs (NO re-analysis)
+        spanish_summary, spanish_explanation = _mirror_to_spanish(
+            english_summary=english_summary,
+            english_explanation=english_explanation,
+            doc_type=doc_type_guess,
+        )
+
+        # 6) Lightweight regex-based items (kept, but no longer the main product)
+        identity_items = _extract_identity_items(clean_text)
+        payment_items, other_amounts = _extract_payment_items(clean_text)
 
         response = {
             "ok": True,
-            "summary": summary,
+
+            # Backwards compatible field (many clients use this)
+            "summary": english_summary,
+
+            # NEW required demo fields
+            "english_summary": english_summary,
+            "english_explanation": english_explanation,
+            "spanish_summary": spanish_summary,
+            "spanish_explanation": spanish_explanation,
+
+            # Extraction payload (structured)
+            "document_type": doc_type_guess,
+            "extracted": extracted,
+
+            # Legacy fields
             "identity_items": identity_items,
             "payment_items": payment_items,
             "other_amounts_items": other_amounts,
-            "translated_text": translated,
+            "translated_text": translated_full,
             "confidence_score": translation_result.get("confidence_score", 0.0),
-            "warnings": translation_result.get("warnings", []),
+            "warnings": (translation_result.get("warnings", []) or []) + (agent_warnings or []),
             "cultural_notes": translation_result.get("cultural_notes", []),
             "enrichment": enrichment,
             "clarifications": clarifications,
@@ -500,4 +541,194 @@ def _build_clarifications(ambiguous_words: List[str], lang: str) -> List[str]:
         )
 
     return prompts
+
+
+# -------------------------------------------------------------------------
+# NEW: Robust doc extraction + summary + explanation
+# -------------------------------------------------------------------------
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+
+class _LLMError(RuntimeError):
+    pass
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+    retry=retry_if_exception_type(_LLMError),
+)
+def _call_openai_json(messages: List[Dict[str, str]], max_tokens: int = 1400) -> Dict[str, Any]:
+    """Call OpenAI and force a JSON object back.
+
+    We do this because humans love uploading chaos and we still need deterministic output.
+    """
+    client = getattr(mailbills_agent, "openai_client", None)
+    if client is None:
+        raise _LLMError("OpenAI client not initialized (missing OPENAI_API_KEY)")
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            raise _LLMError("Empty model response")
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        raise _LLMError(f"Model returned non-JSON: {e}")
+    except Exception as e:
+        raise _LLMError(str(e))
+
+
+def _analyze_document_english(ocr_text: str, ui_lang: str, source_lang: str, enrichment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return English-first structured extraction + summary + plain-language explanation.
+
+    IMPORTANT:
+    - Must not stop early.
+    - Must extract *all* list items if a numbered list exists.
+    - Must work for recipes, receipts, forms, diagrams, plans, posters, etc.
+    """
+    text = (ocr_text or "").strip()
+    if not text:
+        return {
+            "document_type": "unknown",
+            "english_summary": "",
+            "english_explanation": "",
+            "extracted": {
+                "document_type_guess": "unknown",
+                "key_facts": {},
+                "items": [],
+                "recommended_actions": [],
+            },
+            "warnings": ["Empty OCR text"],
+        }
+
+    system = (
+        "You are Voyadecir, a document-understanding assistant. "
+        "Your job is to extract ALL relevant information and explain it in plain English. "
+        "Never stop early. Never output a single example when multiple items exist."
+    )
+
+    instruction = (
+        "TASK:\n"
+        "1) Identify the document type (best guess).\n"
+        "2) Extract key facts and ALL list/table items. If the text contains a numbered list, "
+        "return every item you can find (e.g., 1..10).\n"
+        "3) Provide an English summary (2-6 bullets).\n"
+        "4) Provide an English explanation (plain-language, calm, 6-12 bullets) describing what it is, "
+        "what matters, and what to do next.\n\n"
+        "OUTPUT REQUIREMENTS:\n"
+        "Return ONLY valid JSON with this shape:\n"
+        "{\n"
+        "  \"document_type\": \"...\",\n"
+        "  \"english_summary\": [\"...\"],\n"
+        "  \"english_explanation\": [\"...\"],\n"
+        "  \"extracted\": {\n"
+        "    \"key_facts\": {\"amounts\":[],\"dates\":[],\"deadlines\":[],\"addresses\":[],\"phones\":[],\"emails\":[],\"urls\":[],\"ids\":[],\"names\":[]},\n"
+        "    \"items\": [{\"n\":1,\"title\":\"\",\"detail\":\"\"}],\n"
+        "    \"recommended_actions\": [\"...\"],\n"
+        "    \"notes\": [\"...\"]\n"
+        "  },\n"
+        "  \"warnings\": [\"...\"]\n"
+        "}\n\n"
+        "Rules:\n"
+        "- If a field is missing, use empty arrays/strings, do not omit keys.\n"
+        "- If the document is a recipe, key facts should include servings, cook time, temps, ingredient amounts.\n"
+        "- If it is a receipt, include merchant, date/time, total, payment type if present.\n"
+        "- If it is a form, include names, dates, totals, checkboxes, and any required actions.\n"
+        "- Do not invent facts not present in the text.\n"
+    )
+
+    # Keep prompt size under control without silently losing the end.
+    # For very long text, we keep head + tail because deadlines and totals often live at the end.
+    if len(text) > 18000:
+        text_for_llm = text[:12000] + "\n\n[...TRUNCATED MIDDLE...]\n\n" + text[-5000:]
+        trunc_warning = "Input was long; middle truncated for analysis prompt. Key extraction attempts to preserve end-of-document totals and deadlines."
+    else:
+        text_for_llm = text
+        trunc_warning = ""
+
+    # Give the model any enrichment we already computed via utils (idioms, ambiguity, dictionary lookups, etc.)
+    enrichment_hint = {}
+    try:
+        if isinstance(enrichment, dict):
+            # Keep it small; we only need the highlights.
+            for k in ["ambiguous_words", "idioms", "slang", "religious_terms", "road_signs", "dictionary_data", "profanity", "tone"]:
+                if k in enrichment:
+                    enrichment_hint[k] = enrichment.get(k)
+    except Exception:
+        enrichment_hint = {}
+
+    messages = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": (
+                instruction
+                + "\nENRICHMENT_HINTS (from internal utils):\n"
+                + json.dumps(enrichment_hint, ensure_ascii=False)[:4000]
+                + "\n\nOCR_TEXT:\n"
+                + text_for_llm
+            ),
+        },
+    ]
+
+    data = _call_openai_json(messages)
+
+    # Normalize into the exact shape we want to return.
+    english_summary_list = data.get("english_summary") or []
+    english_explanation_list = data.get("english_explanation") or []
+    extracted = data.get("extracted") or {}
+    warnings = data.get("warnings") or []
+    if trunc_warning:
+        warnings = list(warnings) + [trunc_warning]
+
+    return {
+        "document_type": data.get("document_type", "unknown"),
+        "english_summary": "\n".join([f"- {s}" for s in english_summary_list if str(s).strip()]).strip(),
+        "english_explanation": "\n".join([f"- {s}" for s in english_explanation_list if str(s).strip()]).strip(),
+        "extracted": {
+            "key_facts": extracted.get("key_facts", {}) or {},
+            "items": extracted.get("items", []) or [],
+            "recommended_actions": extracted.get("recommended_actions", []) or [],
+            "notes": extracted.get("notes", []) or [],
+        },
+        "warnings": warnings,
+    }
+
+
+def _mirror_to_spanish(english_summary: str, english_explanation: str, doc_type: str) -> Tuple[str, str]:
+    """Spanish output must be a translation of the English output. No re-analysis."""
+    combo = ("ENGLISH SUMMARY:\n" + (english_summary or "") + "\n\nENGLISH EXPLANATION:\n" + (english_explanation or "")).strip()
+    if not combo:
+        return "", ""
+
+    # Use our translation engine so *all* the utils (idioms, slang, cultural notes, etc.) are considered.
+    t = translate_text(
+        text=combo,
+        source_lang="en",
+        target_lang="es",
+        document_type=doc_type or "ocr_text",
+        user_preferences={"include_cultural_notes": False, "include_alternatives": False},
+    )
+    spanish = (t.get("translated_text") or "").strip()
+    if not spanish:
+        return "", ""
+
+    # Split back out, best-effort.
+    parts = spanish.split("ENGLISH EXPLANATION:")
+    if len(parts) == 2:
+        sp_sum = parts[0].replace("ENGLISH SUMMARY:", "").strip()
+        sp_exp = parts[1].strip()
+        return sp_sum, sp_exp
+
+    # Fallback if split fails
+    return spanish, ""
 
