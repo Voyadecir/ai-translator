@@ -1,321 +1,63 @@
 """MailBills Agent with JSON interpret endpoint.
 
-This module defines the MailBillsAgent class and associated FastAPI routes.  It has been
-modified to support JSON input for interpretation, and exposes a separate file-based
-endpoint for legacy uploads.
+This module implements FastAPI routes for the Mail & Bills Helper.  It accepts OCR text
+and returns structured extraction + summary + plain-language explanation in English,
+plus a mirrored Spanish translation of those outputs (NO second reasoning pass).
 
-The default `/api/mailbills/interpret` endpoint now expects a JSON body with
-`text`, `target_lang`, `ui_lang` and an optional `source_lang`.  It returns a JSON
-response containing a `summary`, lists of `identity_items`, `payment_items`,
-and `other_amounts_items`, along with the translated text and cultural
-enrichment.  The original file-upload interpretation has been moved to
-`/api/mailbills/interpret-file`.
+Key guarantees:
+- Never stop early (extract ALL list items).
+- English output first.
+- Spanish output is a translation of English output.
+- OCR pipeline is NOT modified here.
+- If the LLM step fails, the endpoint falls back to basic summary so uploads still work.
 
+The endpoint supports JSON requests with `text`, `target_lang`, `ui_lang` and an optional `source_lang`.  It returns:
+- `english_summary`, `english_explanation`
+- `spanish_summary`, `spanish_explanation`
+- `extracted` (document_type, items, key_facts, recommended_actions)
+- Legacy fields for compatibility: `summary`, lists of `identity_items`, `payment_items`,
+and `other_amounts_items`, and `translated_text`.
 """
 
-import logging
-import re
+from __future__ import annotations
+
 import json
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime
+import logging
 import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.core.credentials import AzureKeyCredential
-
-from fastapi import APIRouter, UploadFile, File, Query
+from fastapi import APIRouter, File, Query, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from .utils.ocr_preprocessor import assess_image, preprocess_for_ocr
-from .utils.ocr_postprocessor import clean_ocr_output
-from .utils.translation_engine import translate_text
-from .utils.language_detector import detect_language
-from .utils.translation_dictionaries import AUTHORITATIVE_SOURCES
-from .utils.ui_translation import ui_translator
+# Import the existing mailbills_agent core (translation + OCR processing)
+from ai_translator import mailbills_agent
 
 logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api", tags=["mailbills"])
 
+
+# -------------------------------------------------------------------------
+# Request / Response Models
+# -------------------------------------------------------------------------
 
 class InterpretRequest(BaseModel):
-    """JSON schema for interpreting OCR output.
-
-    Attributes
-    ----------
-    text : str
-        The raw OCR text extracted from a document.
-    target_lang : str, default="es"
-        The language to translate the document into.
-    ui_lang : str, default="en"
-        The caller's UI language (not currently used by the model but reserved for future
-        enhancements).
-    source_lang : str, default="en"
-        The language of the original document.  If omitted, a best guess is used.
-    """
-
-    text: str = Field(..., description="The document text to interpret and translate")
-    target_lang: str = Field("es", description="Target language code")
-    ui_lang: str = Field("en", description="UI language code")
-    source_lang: str = Field("auto", description="Source language code")
+    text: str
+    target_lang: Optional[str] = "es"
+    ui_lang: Optional[str] = "en"
+    source_lang: Optional[str] = None
 
 
-class MailBillsAgent:
-    """
-    Main deep agent for omniscient document translation
-    (Docstring unchanged from original for brevity)
-    """
-
-    def __init__(self):
-        """Initialize agent with Azure clients and utilities"""
-        di_endpoint = (
-            os.getenv("AZURE_DOCINTEL_ENDPOINT")
-            or os.getenv("AZURE_DI_ENDPOINT")
-            or os.getenv("AZURE_DOC_INTEL_ENDPOINT")
-        )
-        di_key = (
-            os.getenv("AZURE_DOCINTEL_KEY")
-            or os.getenv("AZURE_DI_API_KEY")
-            or os.getenv("AZURE_DOC_INTEL_KEY")
-        )
-
-        if di_endpoint and di_key:
-            try:
-                self.doc_intel_client = DocumentIntelligenceClient(
-                    endpoint=di_endpoint, credential=AzureKeyCredential(di_key)
-                )
-                logger.info("Azure Document Intelligence initialized")
-            except Exception as e:
-                logger.warning(f"Failed to initialize Document Intelligence: {e}")
-                self.doc_intel_client = None
-        else:
-            self.doc_intel_client = None
-            logger.warning("Azure Document Intelligence credentials not set")
-
-        # OpenAI client (standard OpenAI, not Azure)
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if openai_key:
-            try:
-                self.openai_client = OpenAI(api_key=openai_key)
-                logger.info("OpenAI client initialized")
-            except Exception as e:
-                logger.warning(f"Failed to initialize OpenAI client: {e}")
-                self.openai_client = None
-        else:
-            self.openai_client = None
-            logger.warning("OpenAI API key not set")
-
-        self.document_types = self._load_document_types()
-        self.default_source_lang = "en"
-        self.default_target_lang = "es"
-
-    def _load_document_types(self) -> Dict[str, Dict]:
-        """
-        Load all supported document types (abbreviated).
-        """
-        return {
-            # Example subset of document types for demonstration.
-            "electric_bill": {
-                "name": "Electric Bill",
-                "category": "utility",
-                "keywords": [
-                    "electric",
-                    "electricity",
-                    "kWh",
-                    "meter reading",
-                    "billing period",
-                ],
-                "authority": "Utility",
-            },
-            "water_bill": {
-                "name": "Water Bill",
-                "category": "utility",
-                "keywords": ["water", "sewer", "gallons", "water service"],
-                "authority": "Utility",
-            },
-        }
-
-    def process_document(
-        self,
-        image_bytes: bytes,
-        source_lang: str = "en",
-        target_lang: str = "es",
-        user_preferences: Optional[Dict] = None,
-    ) -> Dict:
-        """
-        Main processing pipeline - orchestrates OCR → translation.
-
-        This implementation mirrors the original for completeness.
-        """
-        result = {
-            "document_type": None,
-            "ocr_text": "",
-            "translated_text": "",
-            "confidence_score": 0.0,
-            "warnings": [],
-            "cultural_notes": [],
-            "clarifications_needed": [],
-            "enrichment": {},
-            "pdf_url": None,
-            "metadata": {"processing_steps": [], "timestamp": datetime.now().isoformat()},
-        }
-
-        try:
-            logger.info("Step 1: Assessing image quality...")
-            quality = assess_image(image_bytes)
-            result["metadata"]["image_quality"] = quality
-            result["metadata"]["processing_steps"].append("image_quality_assessment")
-
-            if quality.get("needs_preprocessing", False):
-                logger.info("Step 2: Preprocessing image for better OCR...")
-                aggressive = quality.get("recommended_aggressive", False)
-                enhanced_bytes, preprocess_metadata = preprocess_for_ocr(
-                    image_bytes, aggressive
-                )
-                result["metadata"]["preprocessing"] = preprocess_metadata
-                result["metadata"]["processing_steps"].append("image_preprocessing")
-                image_to_ocr = enhanced_bytes
-            else:
-                logger.info("Step 2: Image quality good, skipping preprocessing")
-                image_to_ocr = image_bytes
-
-            logger.info("Step 3: Running Azure Document Intelligence OCR...")
-            ocr_raw = self._run_azure_ocr(image_to_ocr)
-            result["metadata"]["processing_steps"].append("azure_ocr")
-
-            if not ocr_raw:
-                result["warnings"].append("OCR failed to extract text")
-                return result
-
-            logger.info("Step 4: Detecting document type...")
-            doc_type = self._detect_document_type(ocr_raw)
-            result["document_type"] = doc_type
-            result["metadata"]["processing_steps"].append("document_type_detection")
-
-            logger.info("Step 5: Postprocessing OCR output...")
-            ocr_cleaned = clean_ocr_output(ocr_raw, doc_type)
-            result["ocr_text"] = ocr_cleaned["cleaned_text"]
-            result["metadata"]["ocr_postprocessing"] = ocr_cleaned
-            result["metadata"]["processing_steps"].append("ocr_postprocessing")
-
-            logger.info("Step 6: Translating with cultural intelligence...")
-            translation_result = translate_text(
-                text=result["ocr_text"],
-                source_lang=source_lang,
-                target_lang=target_lang,
-                document_type=doc_type,
-                user_preferences=user_preferences,
-            )
-
-            result["translated_text"] = translation_result["translated_text"]
-            result["confidence_score"] = translation_result["confidence_score"]
-            result["warnings"].extend(translation_result["warnings"])
-            result["cultural_notes"].extend(translation_result["cultural_notes"])
-            result["enrichment"] = translation_result["enrichment"]
-            result["metadata"]["processing_steps"].append("translation_engine")
-
-            logger.info("Step 7: Checking for ambiguous words...")
-            ambiguous = translation_result["enrichment"].get("ambiguous_words", [])
-            if ambiguous:
-                result["clarifications_needed"] = self._prepare_clarifications(
-                    ambiguous, target_lang
-                )
-                result["metadata"]["processing_steps"].append("clarification_detection")
-
-            logger.info("Step 8: Generating PDF placeholder...")
-            result["metadata"]["processing_steps"].append("pdf_generation")
-
-            logger.info(
-                f"Document processing complete. Type: {doc_type}, Confidence: {result['confidence_score']:.2f}"
-            )
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Document processing error: {e}")
-            result["warnings"].append(f"Processing error: {str(e)}")
-            return result
-
-    def _run_azure_ocr(self, image_bytes: bytes) -> Optional[str]:
-        """Run Azure Document Intelligence OCR"""
-        if not self.doc_intel_client:
-            logger.error("Azure Document Intelligence client not initialized")
-            return None
-
-        try:
-            poller = self.doc_intel_client.begin_analyze_document(
-                "prebuilt-read", image_bytes
-            )
-            result = poller.result()
-            text_content = []
-            for page in result.pages:
-                for line in page.lines:
-                    text_content.append(line.content)
-            return "\n".join(text_content)
-        except Exception as e:
-            logger.error(f"Azure OCR error: {e}")
-            return None
-
-    def _detect_document_type(self, ocr_text: str) -> Optional[str]:
-        """Detect document type from OCR text via keyword matching"""
-        for doc_type, metadata in self.document_types.items():
-            keywords = metadata.get("keywords", [])
-            for keyword in keywords:
-                if keyword.lower() in ocr_text.lower():
-                    logger.info(f"Document type detected by keywords: {doc_type}")
-                    return doc_type
-        return "unknown"
-
-    def _prepare_clarifications(
-        self, ambiguous_words: List[Dict], target_lang: str
-    ) -> List[Dict]:
-        """Prepare clarification questions for ambiguous words"""
-        clarifications = []
-        for word_info in ambiguous_words:
-            word = word_info["word"]
-            meanings = word_info.get("meanings", [])
-            question_text = ui_translator.translate_ui_element(
-                f"Which meaning of '{word}' is correct?",
-                element_type="label",
-                target_lang=target_lang,
-            )
-            clarifications.append(
-                {
-                    "word": word,
-                    "question": question_text,
-                    "options": meanings,
-                    "type": "multiple_choice",
-                }
-            )
-        return clarifications
-
-    def get_authoritative_sources(self) -> List[Dict]:
-        """Return list of authoritative dictionary sources"""
-        sources = []
-        for source_key, source_data in AUTHORITATIVE_SOURCES.items():
-            sources.append(
-                {
-                    "name": source_data["name"],
-                    "url": source_data["url"],
-                    "category": source_data.get("category", "general"),
-                    "description": source_data.get("description", ""),
-                }
-            )
-        return sources
-
-
-# Global agent instance
-mailbills_agent = MailBillsAgent()
-
-# FastAPI router for mail-bills endpoints
-router = APIRouter()
-
+# -------------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------------
 
 @router.get("/mailbills/interpret")
 async def mailbills_interpret_alive() -> JSONResponse:
-    """Health check endpoint for the interpret route."""
+    """Health check for the JSON interpreter."""
     return JSONResponse(
         status_code=200, content={"ok": True, "message": "mailbills/interpret alive"}
     )
@@ -333,28 +75,31 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
       - source_lang: optional source language code; defaults to English
 
     It returns a JSON object with:
-      - summary: a concise explanation of the document
-      - identity_items: list of items needed for identification (empty if none)
-      - payment_items: list of payment instructions (empty if none)
-      - other_amounts_items: list of other important amounts (empty if none)
-      - translated_text: the full translated text
-      - confidence_score: translation confidence
-      - warnings: list of warnings
-      - cultural_notes: list of cultural notes
-      - enrichment: extra information from the translation engine
+      - summary: a concise explanation of the document (legacy)
+      - english_summary / english_explanation
+      - spanish_summary / spanish_explanation (mirrored translation of English)
+      - extracted: structured extraction payload
+      - identity_items / payment_items / other_amounts_items (legacy)
+      - translated_text: the full translated text (legacy)
     """
     try:
-        # 1) Detect source language (best-effort)
-        detected_source, detection_confidence = detect_language(req.text, fallback="en")
-        source_lang = req.source_lang if req.source_lang != "auto" else detected_source
+        raw_text = (req.text or "").strip()
+        if not raw_text:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "Missing OCR text (text is empty)."},
+            )
 
-        # 2) Clean OCR text a bit (keeps meaning, improves structure)
-        cleaned = clean_ocr_output(req.text or "", document_type="unknown")
-        clean_text = (cleaned.get("cleaned_text") or req.text or "").strip()
+        # 1) Normalize OCR text (light)
+        clean_text = _normalize_ocr_text(raw_text)
 
-        # 3) Translate the full OCR text (kept for legacy UI features)
-        translation_result = translate_text(
-            text=clean_text,
+        # 2) Detect source language if not provided (best effort)
+        source_lang = (req.source_lang or "").strip() or _guess_source_lang(clean_text)
+        detection_confidence = 0.6  # placeholder; keep for compatibility
+
+        # 3) Translate using existing pipeline (this is where your utils matter)
+        translation_result = mailbills_agent.translate_text(
+            clean_text,
             source_lang=source_lang or "en",
             target_lang=req.target_lang or "es",
             document_type="ocr_text",
@@ -366,25 +111,46 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
         clarifications = _build_clarifications(ambiguous_words, req.ui_lang or req.target_lang)
 
         # 4) NEW: Robust extraction + summary + plain-language explanation (English first)
-        analysis = _analyze_document_english(
-            ocr_text=clean_text,
-            ui_lang=req.ui_lang or "en",
-            source_lang=source_lang or "en",
-            enrichment=enrichment,
-        )
+        agent_warnings: List[str] = []
+        try:
+            analysis = _analyze_document_english(
+                ocr_text=clean_text,
+                ui_lang=req.ui_lang or "en",
+                source_lang=source_lang or "en",
+                enrichment=enrichment,
+            )
 
-        english_summary = analysis.get("english_summary", "")
-        english_explanation = analysis.get("english_explanation", "")
-        extracted = analysis.get("extracted", {})
-        doc_type_guess = analysis.get("document_type", "unknown")
-        agent_warnings = analysis.get("warnings", [])
+            english_summary = analysis.get("english_summary", "")
+            english_explanation = analysis.get("english_explanation", "")
+            extracted = analysis.get("extracted", {})
+            doc_type_guess = analysis.get("document_type", "unknown")
+            agent_warnings = analysis.get("warnings", []) or []
+        except Exception as e:
+            # IMPORTANT: Do not break uploads just because the LLM step failed.
+            logger.exception(f"LLM extraction failed; falling back. Error: {e}")
+            agent_warnings = [f"LLM extraction failed; using fallback summary. Error: {e}"]
+            doc_type_guess = "unknown"
+            extracted = {"key_facts": {}, "items": [], "recommended_actions": [], "notes": []}
+
+            # Fallback: keep the app usable. Basic summary from the translated text.
+            english_summary = _summarize_translation(translated_full, "en")
+            english_explanation = (
+                "- This looks like a document upload.\\n"
+                "- Extraction is temporarily unavailable; showing a basic summary.\\n"
+                "- If this keeps happening, check service configuration (OPENAI_API_KEY) and logs."
+            )
 
         # 5) Mirror Spanish as a translation of the English outputs (NO re-analysis)
-        spanish_summary, spanish_explanation = _mirror_to_spanish(
-            english_summary=english_summary,
-            english_explanation=english_explanation,
-            doc_type=doc_type_guess,
-        )
+        try:
+            spanish_summary, spanish_explanation = _mirror_to_spanish(
+                english_summary=english_summary,
+                english_explanation=english_explanation,
+                doc_type=doc_type_guess,
+            )
+        except Exception as e:
+            logger.exception(f"Spanish mirror failed; continuing without it. Error: {e}")
+            agent_warnings = (agent_warnings or []) + [f"Spanish mirror failed: {e}"]
+            spanish_summary, spanish_explanation = "", ""
 
         # 6) Lightweight regex-based items (kept, but no longer the main product)
         identity_items = _extract_identity_items(clean_text)
@@ -396,13 +162,13 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
             # Backwards compatible field (many clients use this)
             "summary": english_summary,
 
-            # NEW required demo fields
+            # New robust fields
             "english_summary": english_summary,
             "english_explanation": english_explanation,
             "spanish_summary": spanish_summary,
             "spanish_explanation": spanish_explanation,
 
-            # Extraction payload (structured)
+            # Structured extraction payload
             "document_type": doc_type_guess,
             "extracted": extracted,
 
@@ -411,20 +177,22 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
             "payment_items": payment_items,
             "other_amounts_items": other_amounts,
             "translated_text": translated_full,
-            "confidence_score": translation_result.get("confidence_score", 0.0),
-            "warnings": (translation_result.get("warnings", []) or []) + (agent_warnings or []),
-            "cultural_notes": translation_result.get("cultural_notes", []),
+
+            # Compatibility fields you already returned
+            "confidence_score": translation_result.get("confidence_score", None),
             "enrichment": enrichment,
             "clarifications": clarifications,
             "detected_source_lang": source_lang,
             "detection_confidence": detection_confidence,
+
+            # Warnings
+            "warnings": agent_warnings,
         }
         return JSONResponse(status_code=200, content=response)
+
     except Exception as exc:
         logger.exception(f"JSON interpret failed: {exc}")
-        return JSONResponse(
-            status_code=500, content={"ok": False, "error": str(exc)}
-        )
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
 
 
 @router.get("/mailbills/interpret-file")
@@ -444,7 +212,7 @@ async def mailbills_interpret_file(
     """
     Legacy endpoint for interpreting and translating uploaded files.
 
-    Expects an uploaded PDF or image file.  Returns the same output structure as
+    Expects an uploaded PDF or image file. Returns the same output structure as
     the original implementation.
     """
     try:
@@ -455,87 +223,41 @@ async def mailbills_interpret_file(
         return JSONResponse(status_code=200, content={"ok": True, **result})
     except Exception as exc:
         logger.exception(f"mailbills interpret-file failed: {exc}")
-        return JSONResponse(
-            status_code=500, content={"ok": False, "error": str(exc)}
-        )
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+
 # ------------------------------
 # Helpers
 # ------------------------------
 
-
-def _summarize_translation(translated: str, target_lang: str) -> str:
-    clean = (translated or "").replace("\n", " ").strip()
-    if not clean:
-        return ""
-
-    sentences = re.split(r"(?<=[\.\!\?])\s+", clean)
-    summary = " ".join(sentences[:2]).strip()
-    return summary or clean[:240]
+def _normalize_ocr_text(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
-def _extract_identity_items(text: str) -> List[str]:
-    patterns = [
-        r"account\s*(?:number|no\.?|#)\s*[:#]?\s*([A-Za-z0-9\-]+)",
-        r"customer\s*id\s*[:#]?\s*([A-Za-z0-9\-]+)",
-        r"invoice\s*[:#]?\s*([A-Za-z0-9\-]+)",
-        r"policy\s*(?:number|no\.?|#)?\s*[:#]?\s*([A-Za-z0-9\-]+)",
-    ]
-
-    found: List[str] = []
-    lower_text = text.lower()
-    for pattern in patterns:
-        for match in re.finditer(pattern, lower_text, flags=re.IGNORECASE):
-            val = match.group(1)
-            if val and val not in found:
-                found.append(val)
-
-    # Also pick lines with obvious identifiers
-    for line in text.splitlines():
-        if any(keyword in line.lower() for keyword in ["account", "customer", "invoice", "policy"]):
-            cleaned = line.strip()
-            if cleaned and cleaned not in found:
-                found.append(cleaned)
-
-    return found[:5]
+def _guess_source_lang(text: str) -> str:
+    # Best-effort: if a lot of Spanish markers appear, guess 'es'
+    sample = (text or "").lower()
+    spanish_hits = sum(
+        1 for w in [" el ", " la ", " de ", " y ", " que ", " por ", " para ", " una ", " un "]
+        if w in f" {sample} "
+    )
+    return "es" if spanish_hits >= 3 else "en"
 
 
-def _extract_payment_items(text: str) -> (List[str], List[str]):
-    amounts = []
-    other_amounts: List[str] = []
-    due_dates: List[str] = []
-    currency_pattern = re.compile(r"(?:USD|US\$|\$|€|£)\s?\d[\d,]*(?:\.\d{2})?")
-    date_pattern = re.compile(r"(?:due|fecha|vence)[^\d]*(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})", re.IGNORECASE)
-
-    for line in text.splitlines():
-        amount_matches = currency_pattern.findall(line)
-        if amount_matches:
-            if any(word in line.lower() for word in ["due", "pagar", "amount due", "total", "balance"]):
-                amounts.extend(amount_matches)
-            else:
-                other_amounts.extend(amount_matches)
-
-        date_matches = date_pattern.findall(line)
-        due_dates.extend(date_matches)
-
-    payment_items: List[str] = []
-    if amounts:
-        payment_items.append("Amount due: " + ", ".join(dict.fromkeys(amounts)))
-    if due_dates:
-        payment_items.append("Due date(s): " + ", ".join(dict.fromkeys(due_dates)))
-
-    return payment_items[:5], other_amounts[:5]
-
-
-def _build_clarifications(ambiguous_words: List[str], lang: str) -> List[str]:
-    if not ambiguous_words:
-        return []
-
+def _build_clarifications(ambiguous_words: List[str], ui_lang: Optional[str]) -> List[Dict[str, Any]]:
     prompts = []
-    for word in ambiguous_words:
+    if not ambiguous_words:
+        return prompts
+
+    ui_translator = getattr(mailbills_agent, "ui_translator", None)
+    for word in ambiguous_words[:10]:
         prompts.append(
             {
                 "word": word,
-                "prompt": ui_translator.get_clarification_prompt(word, lang) if hasattr(ui_translator, "get_clarification_prompt") else None,
+                "prompt": ui_translator.get_clarification_prompt(word, ui_lang) if hasattr(ui_translator, "get_clarification_prompt") else None,
                 "question": f"Can you clarify what '{word}' refers to?",
             }
         )
@@ -561,9 +283,10 @@ class _LLMError(RuntimeError):
     retry=retry_if_exception_type(_LLMError),
 )
 def _call_openai_json(messages: List[Dict[str, str]], max_tokens: int = 1400) -> Dict[str, Any]:
-    """Call OpenAI and force a JSON object back.
+    """Call OpenAI and parse a JSON object back.
 
-    We do this because humans love uploading chaos and we still need deterministic output.
+    NOTE: We intentionally avoid `response_format=...` here to remain compatible with older
+    OpenAI SDK versions that don't support it.
     """
     client = getattr(mailbills_agent, "openai_client", None)
     if client is None:
@@ -575,7 +298,6 @@ def _call_openai_json(messages: List[Dict[str, str]], max_tokens: int = 1400) ->
             messages=messages,
             temperature=0.2,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"},
         )
         content = (resp.choices[0].message.content or "").strip()
         if not content:
@@ -587,7 +309,12 @@ def _call_openai_json(messages: List[Dict[str, str]], max_tokens: int = 1400) ->
         raise _LLMError(str(e))
 
 
-def _analyze_document_english(ocr_text: str, ui_lang: str, source_lang: str, enrichment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _analyze_document_english(
+    ocr_text: str,
+    ui_lang: str,
+    source_lang: str,
+    enrichment: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Return English-first structured extraction + summary + plain-language explanation.
 
     IMPORTANT:
@@ -610,6 +337,13 @@ def _analyze_document_english(ocr_text: str, ui_lang: str, source_lang: str, enr
             "warnings": ["Empty OCR text"],
         }
 
+    # Guard against huge inputs: preserve full meaning but reduce token bloat
+    text_for_llm = text
+    trunc_warning = None
+    if len(text_for_llm) > 20000:
+        trunc_warning = "OCR text was very long; it was truncated for analysis."
+        text_for_llm = text_for_llm[:20000]
+
     system = (
         "You are Voyadecir, a document-understanding assistant. "
         "Your job is to extract ALL relevant information and explain it in plain English. "
@@ -624,43 +358,40 @@ def _analyze_document_english(ocr_text: str, ui_lang: str, source_lang: str, enr
         "3) Provide an English summary (2-6 bullets).\n"
         "4) Provide an English explanation (plain-language, calm, 6-12 bullets) describing what it is, "
         "what matters, and what to do next.\n\n"
-        "OUTPUT REQUIREMENTS:\n"
+        "OUTPUT FORMAT:\n"
         "Return ONLY valid JSON with this shape:\n"
         "{\n"
-        "  \"document_type\": \"...\",\n"
-        "  \"english_summary\": [\"...\"],\n"
-        "  \"english_explanation\": [\"...\"],\n"
-        "  \"extracted\": {\n"
-        "    \"key_facts\": {\"amounts\":[],\"dates\":[],\"deadlines\":[],\"addresses\":[],\"phones\":[],\"emails\":[],\"urls\":[],\"ids\":[],\"names\":[]},\n"
-        "    \"items\": [{\"n\":1,\"title\":\"\",\"detail\":\"\"}],\n"
-        "    \"recommended_actions\": [\"...\"],\n"
-        "    \"notes\": [\"...\"]\n"
+        '  "document_type": string,\n'
+        '  "english_summary": [string, ...],\n'
+        '  "english_explanation": [string, ...],\n'
+        '  "extracted": {\n'
+        '     "key_facts": { "dates":[], "amounts":[], "deadlines":[], "names":[], "addresses":[], "phones":[], "urls":[], "ids":[] },\n'
+        '     "items": [ { "n": 1, "title": "...", "detail": "..." }, ... ],\n'
+        '     "recommended_actions": [string, ...]\n'
         "  },\n"
-        "  \"warnings\": [\"...\"]\n"
+        '  "warnings": [string, ...]\n'
         "}\n\n"
         "Rules:\n"
-        "- If a field is missing, use empty arrays/strings, do not omit keys.\n"
-        "- If the document is a recipe, key facts should include servings, cook time, temps, ingredient amounts.\n"
-        "- If it is a receipt, include merchant, date/time, total, payment type if present.\n"
-        "- If it is a form, include names, dates, totals, checkboxes, and any required actions.\n"
-        "- Do not invent facts not present in the text.\n"
+        "- If you are unsure, set fields to empty lists/objects, do not invent.\n"
+        "- If there is a numbered list, include ALL items.\n"
+        "- Keep items in the original order.\n"
+        "- No markdown, no extra text outside JSON.\n"
     )
 
-    # Keep prompt size under control without silently losing the end.
-    # For very long text, we keep head + tail because deadlines and totals often live at the end.
-    if len(text) > 18000:
-        text_for_llm = text[:12000] + "\n\n[...TRUNCATED MIDDLE...]\n\n" + text[-5000:]
-        trunc_warning = "Input was long; middle truncated for analysis prompt. Key extraction attempts to preserve end-of-document totals and deadlines."
-    else:
-        text_for_llm = text
-        trunc_warning = ""
-
-    # Give the model any enrichment we already computed via utils (idioms, ambiguity, dictionary lookups, etc.)
-    enrichment_hint = {}
+    enrichment_hint: Dict[str, Any] = {}
     try:
         if isinstance(enrichment, dict):
             # Keep it small; we only need the highlights.
-            for k in ["ambiguous_words", "idioms", "slang", "religious_terms", "road_signs", "dictionary_data", "profanity", "tone"]:
+            for k in [
+                "ambiguous_words",
+                "idioms",
+                "slang",
+                "religious_terms",
+                "road_signs",
+                "dictionary_data",
+                "profanity",
+                "tone",
+            ]:
                 if k in enrichment:
                     enrichment_hint[k] = enrichment.get(k)
     except Exception:
@@ -688,36 +419,59 @@ def _analyze_document_english(ocr_text: str, ui_lang: str, source_lang: str, enr
     extracted = data.get("extracted") or {}
     warnings = data.get("warnings") or []
     if trunc_warning:
-        warnings = list(warnings) + [trunc_warning]
+        warnings = (warnings or []) + [trunc_warning]
+
+    # Convert list bullets into a single string for the UI boxes.
+    english_summary = _bullets_to_text(english_summary_list)
+    english_explanation = _bullets_to_text(english_explanation_list)
 
     return {
-        "document_type": data.get("document_type", "unknown"),
-        "english_summary": "\n".join([f"- {s}" for s in english_summary_list if str(s).strip()]).strip(),
-        "english_explanation": "\n".join([f"- {s}" for s in english_explanation_list if str(s).strip()]).strip(),
-        "extracted": {
-            "key_facts": extracted.get("key_facts", {}) or {},
-            "items": extracted.get("items", []) or [],
-            "recommended_actions": extracted.get("recommended_actions", []) or [],
-            "notes": extracted.get("notes", []) or [],
-        },
+        "document_type": data.get("document_type") or "unknown",
+        "english_summary": english_summary,
+        "english_explanation": english_explanation,
+        "extracted": extracted,
         "warnings": warnings,
     }
 
 
+def _bullets_to_text(items: List[str]) -> str:
+    if not items:
+        return ""
+    lines = []
+    for s in items:
+        s = (s or "").strip()
+        if not s:
+            continue
+        # Ensure bullets
+        if not s.startswith("-"):
+            s = "- " + s
+        lines.append(s)
+    return "\n".join(lines).strip()
+
+
 def _mirror_to_spanish(english_summary: str, english_explanation: str, doc_type: str) -> Tuple[str, str]:
-    """Spanish output must be a translation of the English output. No re-analysis."""
-    combo = ("ENGLISH SUMMARY:\n" + (english_summary or "") + "\n\nENGLISH EXPLANATION:\n" + (english_explanation or "")).strip()
-    if not combo:
+    """Mirror Spanish output as a translation of the English output.
+
+    IMPORTANT: This is translation only, not re-analysis.
+    """
+    combined = (
+        "ENGLISH SUMMARY:\n"
+        + (english_summary or "").strip()
+        + "\n\nENGLISH EXPLANATION:\n"
+        + (english_explanation or "").strip()
+    ).strip()
+
+    if not combined:
         return "", ""
 
-    # Use our translation engine so *all* the utils (idioms, slang, cultural notes, etc.) are considered.
-    t = translate_text(
-        text=combo,
+    t = mailbills_agent.translate_text(
+        combined,
         source_lang="en",
         target_lang="es",
         document_type=doc_type or "ocr_text",
-        user_preferences={"include_cultural_notes": False, "include_alternatives": False},
+        user_preferences=None,
     )
+
     spanish = (t.get("translated_text") or "").strip()
     if not spanish:
         return "", ""
@@ -732,3 +486,76 @@ def _mirror_to_spanish(english_summary: str, english_explanation: str, doc_type:
     # Fallback if split fails
     return spanish, ""
 
+
+# -------------------------------------------------------------------------
+# Legacy extraction helpers (kept for compatibility)
+# -------------------------------------------------------------------------
+
+def _summarize_translation(translated_text: str, lang: str) -> str:
+    """
+    Very lightweight fallback summary: first 1-2 sentences.
+    Used ONLY when the robust extraction step fails.
+    """
+    t = (translated_text or "").strip()
+    if not t:
+        return ""
+
+    # Split on sentence boundaries (rough).
+    parts = re.split(r"(?<=[\.\!\?])\s+", t)
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts:
+        return t[:200].strip()
+
+    return " ".join(parts[:2]).strip()
+
+
+def _extract_identity_items(text: str) -> List[str]:
+    """
+    Extract things that look like identifying info from OCR text (very lightweight).
+    """
+    if not text:
+        return []
+
+    patterns = [
+        r"\baccount\b",
+        r"\bacct\b",
+        r"\bmember\b",
+        r"\bpolicy\b",
+        r"\bssn\b",
+        r"\bid\b",
+        r"\bcase\b",
+        r"\bref(erence)?\b",
+    ]
+    found = []
+    lower = text.lower()
+    for pat in patterns:
+        if re.search(pat, lower):
+            found.append(pat.strip("\\b"))
+    return sorted(set(found))
+
+
+def _extract_payment_items(text: str) -> Tuple[List[str], List[str]]:
+    """
+    Extract payment instructions and other amounts (very lightweight).
+    """
+    if not text:
+        return [], []
+
+    payment_items: List[str] = []
+    other_amounts: List[str] = []
+
+    lower = text.lower()
+
+    if "amount due" in lower or "balance due" in lower:
+        payment_items.append("Amount due / Balance due")
+
+    if "due date" in lower or "pay by" in lower:
+        payment_items.append("Due date / Pay-by date")
+
+    # Extract dollar amounts
+    amounts = re.findall(r"\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})", text)
+    amounts = [a.strip() for a in amounts if a.strip()]
+    if amounts:
+        other_amounts.extend(amounts[:25])
+
+    return payment_items, other_amounts
