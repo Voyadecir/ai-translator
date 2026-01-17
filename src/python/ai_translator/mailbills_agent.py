@@ -1,6 +1,6 @@
 """MailBills Agent with JSON interpret endpoint.
 
-This module implements FastAPI routes for the Mail & Bills Helper.  It accepts OCR text
+This module implements FastAPI routes for the Mail & Bills Helper. It accepts OCR text
 and returns structured extraction + summary + plain-language explanation in English,
 plus a mirrored Spanish translation of those outputs (NO second reasoning pass).
 
@@ -11,7 +11,7 @@ Key guarantees:
 - OCR pipeline is NOT modified here.
 - If the LLM step fails, the endpoint falls back to basic summary so uploads still work.
 
-The endpoint supports JSON requests with `text`, `target_lang`, `ui_lang` and an optional `source_lang`.  It returns:
+The endpoint supports JSON requests with `text`, `target_lang`, `ui_lang` and an optional `source_lang`. It returns:
 - `english_summary`, `english_explanation`
 - `spanish_summary`, `spanish_explanation`
 - `extracted` (document_type, items, key_facts, recommended_actions)
@@ -33,8 +33,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-# Import the existing mailbills_agent core (translation + OCR processing)
-from ai_translator import mailbills_agent
+# IMPORTANT:
+# This file defines the FastAPI router for the Mail & Bills Helper.
+# It MUST NOT import `ai_translator.mailbills_agent` (itself), or Python will
+# resolve the import to this module and you'll get runtime errors like:
+#   "module 'ai_translator.mailbills_agent' has no attribute 'translate_text'"
+#
+# Use the shared translation engine instead.
+from ai_translator.utils.translation_engine import translate_text as _translate_text
+from ai_translator.utils.translation_engine import translation_engine as _translation_engine
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -98,7 +105,7 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
         detection_confidence = 0.6  # placeholder; keep for compatibility
 
         # 3) Translate using existing pipeline (this is where your utils matter)
-        translation_result = mailbills_agent.translate_text(
+        translation_result = _translate_text(
             clean_text,
             source_lang=source_lang or "en",
             target_lang=req.target_lang or "es",
@@ -110,7 +117,7 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
         ambiguous_words = enrichment.get("ambiguous_words", [])
         clarifications = _build_clarifications(ambiguous_words, req.ui_lang or req.target_lang)
 
-        # 4) NEW: Robust extraction + summary + plain-language explanation (English first)
+        # 4) Robust extraction + summary + plain-language explanation (English first)
         agent_warnings: List[str] = []
         try:
             analysis = _analyze_document_english(
@@ -135,8 +142,8 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
             # Fallback: keep the app usable. Basic summary from the translated text.
             english_summary = _summarize_translation(translated_full, "en")
             english_explanation = (
-                "- This looks like a document upload.\\n"
-                "- Extraction is temporarily unavailable; showing a basic summary.\\n"
+                "- This looks like a document upload.\n"
+                "- Extraction is temporarily unavailable; showing a basic summary.\n"
                 "- If this keeps happening, check service configuration (OPENAI_API_KEY) and logs."
             )
 
@@ -152,7 +159,7 @@ async def mailbills_interpret_json(req: InterpretRequest) -> JSONResponse:
             agent_warnings = (agent_warnings or []) + [f"Spanish mirror failed: {e}"]
             spanish_summary, spanish_explanation = "", ""
 
-        # 6) Lightweight regex-based items (kept, but no longer the main product)
+        # 6) Lightweight regex-based items (kept for compatibility)
         identity_items = _extract_identity_items(clean_text)
         payment_items, other_amounts = _extract_payment_items(clean_text)
 
@@ -212,18 +219,16 @@ async def mailbills_interpret_file(
     """
     Legacy endpoint for interpreting and translating uploaded files.
 
-    Expects an uploaded PDF or image file. Returns the same output structure as
-    the original implementation.
+    NOTE: In the current Voyadecir architecture, OCR happens in Azure Functions and
+    this service receives OCR text via /mailbills/interpret.
     """
-    try:
-        file_bytes = await file.read()
-        result = mailbills_agent.process_document(
-            file_bytes, source_lang=source_lang, target_lang=target_lang, user_preferences=None
-        )
-        return JSONResponse(status_code=200, content={"ok": True, **result})
-    except Exception as exc:
-        logger.exception(f"mailbills interpret-file failed: {exc}")
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+    return JSONResponse(
+        status_code=410,
+        content={
+            "ok": False,
+            "error": "Deprecated endpoint. Use POST /mailbills/interpret with OCR text.",
+        },
+    )
 
 
 # ------------------------------
@@ -238,7 +243,6 @@ def _normalize_ocr_text(text: str) -> str:
 
 
 def _guess_source_lang(text: str) -> str:
-    # Best-effort: if a lot of Spanish markers appear, guess 'es'
     sample = (text or "").lower()
     spanish_hits = sum(
         1 for w in [" el ", " la ", " de ", " y ", " que ", " por ", " para ", " una ", " un "]
@@ -251,22 +255,19 @@ def _build_clarifications(ambiguous_words: List[str], ui_lang: Optional[str]) ->
     prompts = []
     if not ambiguous_words:
         return prompts
-
-    ui_translator = getattr(mailbills_agent, "ui_translator", None)
     for word in ambiguous_words[:10]:
         prompts.append(
             {
                 "word": word,
-                "prompt": ui_translator.get_clarification_prompt(word, ui_lang) if hasattr(ui_translator, "get_clarification_prompt") else None,
+                "prompt": None,
                 "question": f"Can you clarify what '{word}' refers to?",
             }
         )
-
     return prompts
 
 
 # -------------------------------------------------------------------------
-# NEW: Robust doc extraction + summary + explanation
+# Robust doc extraction + summary + explanation
 # -------------------------------------------------------------------------
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -283,14 +284,10 @@ class _LLMError(RuntimeError):
     retry=retry_if_exception_type(_LLMError),
 )
 def _call_openai_json(messages: List[Dict[str, str]], max_tokens: int = 1400) -> Dict[str, Any]:
-    """Call OpenAI and parse a JSON object back.
-
-    NOTE: We intentionally avoid `response_format=...` here to remain compatible with older
-    OpenAI SDK versions that don't support it.
-    """
-    client = getattr(mailbills_agent, "openai_client", None)
+    """Call OpenAI and parse a JSON object back."""
+    client = getattr(_translation_engine, "client", None)
     if client is None:
-        raise _LLMError("OpenAI client not initialized (missing OPENAI_API_KEY)")
+        raise _LLMError("OpenAI client not initialized (check OPENAI_API_KEY / Azure OpenAI settings)")
 
     try:
         resp = client.chat.completions.create(
@@ -315,145 +312,102 @@ def _analyze_document_english(
     source_lang: str,
     enrichment: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Return English-first structured extraction + summary + plain-language explanation.
-
-    IMPORTANT:
-    - Must not stop early.
-    - Must extract *all* list items if a numbered list exists.
-    - Must work for recipes, receipts, forms, diagrams, plans, posters, etc.
-    """
     text = (ocr_text or "").strip()
     if not text:
         return {
             "document_type": "unknown",
             "english_summary": "",
             "english_explanation": "",
-            "extracted": {
-                "document_type_guess": "unknown",
-                "key_facts": {},
-                "items": [],
-                "recommended_actions": [],
-            },
-            "warnings": ["Empty OCR text"],
+            "extracted": {"document_type_guess": "unknown", "key_facts": {}, "items": [], "recommended_actions": [], "notes": []},
+            "warnings": [],
         }
 
-    # Guard against huge inputs: preserve full meaning but reduce token bloat
-    text_for_llm = text
-    trunc_warning = None
-    if len(text_for_llm) > 20000:
-        trunc_warning = "OCR text was very long; it was truncated for analysis."
-        text_for_llm = text_for_llm[:20000]
-
-    system = (
-        "You are Voyadecir, a document-understanding assistant. "
-        "Your job is to extract ALL relevant information and explain it in plain English. "
-        "Never stop early. Never output a single example when multiple items exist."
+    prompt = (
+        "You are a document-understanding assistant.\n"
+        "Return ONLY valid JSON.\n"
+        "Task:\n"
+        "1) Identify document_type.\n"
+        "2) Extract key_facts and items (do not stop early).\n"
+        "3) Write english_summary and english_explanation in plain language.\n"
+        "Output JSON keys: document_type, english_summary, english_explanation, extracted, warnings.\n"
     )
-
-    instruction = (
-        "TASK:\n"
-        "1) Identify the document type (best guess).\n"
-        "2) Extract key facts and ALL list/table items. If the text contains a numbered list, "
-        "return every item you can find (e.g., 1..10).\n"
-        "3) Provide an English summary (2-6 bullets).\n"
-        "4) Provide an English explanation (plain-language, calm, 6-12 bullets) describing what it is, "
-        "what matters, and what to do next.\n\n"
-        "OUTPUT FORMAT:\n"
-        "Return ONLY valid JSON with this shape:\n"
-        "{\n"
-        '  "document_type": string,\n'
-        '  "english_summary": [string, ...],\n'
-        '  "english_explanation": [string, ...],\n'
-        '  "extracted": {\n'
-        '     "key_facts": { "dates":[], "amounts":[], "deadlines":[], "names":[], "addresses":[], "phones":[], "urls":[], "ids":[] },\n'
-        '     "items": [ { "n": 1, "title": "...", "detail": "..." }, ... ],\n'
-        '     "recommended_actions": [string, ...]\n'
-        "  },\n"
-        '  "warnings": [string, ...]\n'
-        "}\n\n"
-        "Rules:\n"
-        "- If you are unsure, set fields to empty lists/objects, do not invent.\n"
-        "- If there is a numbered list, include ALL items.\n"
-        "- Keep items in the original order.\n"
-        "- No markdown, no extra text outside JSON.\n"
-    )
-
-    enrichment_hint: Dict[str, Any] = {}
-    try:
-        if isinstance(enrichment, dict):
-            # Keep it small; we only need the highlights.
-            for k in [
-                "ambiguous_words",
-                "idioms",
-                "slang",
-                "religious_terms",
-                "road_signs",
-                "dictionary_data",
-                "profanity",
-                "tone",
-            ]:
-                if k in enrichment:
-                    enrichment_hint[k] = enrichment.get(k)
-    except Exception:
-        enrichment_hint = {}
 
     messages = [
-        {"role": "system", "content": system},
-        {
-            "role": "user",
-            "content": (
-                instruction
-                + "\nENRICHMENT_HINTS (from internal utils):\n"
-                + json.dumps(enrichment_hint, ensure_ascii=False)[:4000]
-                + "\n\nOCR_TEXT:\n"
-                + text_for_llm
-            ),
-        },
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": text[:12000]},
     ]
 
-    data = _call_openai_json(messages)
+    obj = _call_openai_json(messages)
 
-    # Normalize into the exact shape we want to return.
-    english_summary_list = data.get("english_summary") or []
-    english_explanation_list = data.get("english_explanation") or []
-    extracted = data.get("extracted") or {}
-    warnings = data.get("warnings") or []
-    if trunc_warning:
-        warnings = (warnings or []) + [trunc_warning]
+    # Minimal normalization
+    doc_type = str(obj.get("document_type") or "unknown")
+    english_summary = str(obj.get("english_summary") or "").strip()
+    english_explanation = str(obj.get("english_explanation") or "").strip()
+    extracted = obj.get("extracted") or {}
+    warnings = obj.get("warnings") or []
 
-    # Convert list bullets into a single string for the UI boxes.
-    english_summary = _bullets_to_text(english_summary_list)
-    english_explanation = _bullets_to_text(english_explanation_list)
+    if not isinstance(extracted, dict):
+        extracted = {}
 
     return {
-        "document_type": data.get("document_type") or "unknown",
+        "document_type": doc_type,
         "english_summary": english_summary,
         "english_explanation": english_explanation,
         "extracted": extracted,
-        "warnings": warnings,
+        "warnings": warnings if isinstance(warnings, list) else [],
     }
 
 
-def _bullets_to_text(items: List[str]) -> str:
-    if not items:
+# -------------------------------------------------------------------------
+# Legacy extraction helpers (kept for compatibility)
+# -------------------------------------------------------------------------
+
+def _extract_identity_items(text: str) -> List[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    hits = []
+    for pat in [
+        r"\bAccount\s*#?:\s*([A-Za-z0-9\-\*]{4,})",
+        r"\bPolicy\s*#?:\s*([A-Za-z0-9\-\*]{4,})",
+        r"\bMember\s*ID\s*#?:\s*([A-Za-z0-9\-\*]{4,})",
+    ]:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            hits.append(m.group(0).strip())
+    return hits
+
+
+def _extract_payment_items(text: str) -> Tuple[List[str], List[str]]:
+    t = (text or "").strip()
+    if not t:
+        return [], []
+    payments = []
+    others = []
+    for pat in [
+        r"\bTotal\s+Due\b.*",
+        r"\bAmount\s+Due\b.*",
+        r"\bBalance\b.*",
+    ]:
+        for m in re.finditer(pat, t, flags=re.IGNORECASE):
+            line = m.group(0).strip()
+            if line:
+                payments.append(line)
+    return payments[:20], others[:20]
+
+
+def _summarize_translation(translated_text: str, lang: str) -> str:
+    t = (translated_text or "").strip()
+    if not t:
         return ""
-    lines = []
-    for s in items:
-        s = (s or "").strip()
-        if not s:
-            continue
-        # Ensure bullets
-        if not s.startswith("-"):
-            s = "- " + s
-        lines.append(s)
-    return "\n".join(lines).strip()
+    parts = re.split(r"(?<=[\.\!\?])\s+", t)
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts:
+        return t[:200].strip()
+    return " ".join(parts[:2]).strip()
 
 
 def _mirror_to_spanish(english_summary: str, english_explanation: str, doc_type: str) -> Tuple[str, str]:
-    """Mirror Spanish output as a translation of the English output.
-
-    IMPORTANT: This is translation only, not re-analysis.
-    """
     combined = (
         "ENGLISH SUMMARY:\n"
         + (english_summary or "").strip()
@@ -464,7 +418,7 @@ def _mirror_to_spanish(english_summary: str, english_explanation: str, doc_type:
     if not combined:
         return "", ""
 
-    t = mailbills_agent.translate_text(
+    t = _translate_text(
         combined,
         source_lang="en",
         target_lang="es",
@@ -476,86 +430,10 @@ def _mirror_to_spanish(english_summary: str, english_explanation: str, doc_type:
     if not spanish:
         return "", ""
 
-    # Split back out, best-effort.
     parts = spanish.split("ENGLISH EXPLANATION:")
     if len(parts) == 2:
         sp_sum = parts[0].replace("ENGLISH SUMMARY:", "").strip()
         sp_exp = parts[1].strip()
         return sp_sum, sp_exp
 
-    # Fallback if split fails
     return spanish, ""
-
-
-# -------------------------------------------------------------------------
-# Legacy extraction helpers (kept for compatibility)
-# -------------------------------------------------------------------------
-
-def _summarize_translation(translated_text: str, lang: str) -> str:
-    """
-    Very lightweight fallback summary: first 1-2 sentences.
-    Used ONLY when the robust extraction step fails.
-    """
-    t = (translated_text or "").strip()
-    if not t:
-        return ""
-
-    # Split on sentence boundaries (rough).
-    parts = re.split(r"(?<=[\.\!\?])\s+", t)
-    parts = [p.strip() for p in parts if p.strip()]
-    if not parts:
-        return t[:200].strip()
-
-    return " ".join(parts[:2]).strip()
-
-
-def _extract_identity_items(text: str) -> List[str]:
-    """
-    Extract things that look like identifying info from OCR text (very lightweight).
-    """
-    if not text:
-        return []
-
-    patterns = [
-        r"\baccount\b",
-        r"\bacct\b",
-        r"\bmember\b",
-        r"\bpolicy\b",
-        r"\bssn\b",
-        r"\bid\b",
-        r"\bcase\b",
-        r"\bref(erence)?\b",
-    ]
-    found = []
-    lower = text.lower()
-    for pat in patterns:
-        if re.search(pat, lower):
-            found.append(pat.strip("\\b"))
-    return sorted(set(found))
-
-
-def _extract_payment_items(text: str) -> Tuple[List[str], List[str]]:
-    """
-    Extract payment instructions and other amounts (very lightweight).
-    """
-    if not text:
-        return [], []
-
-    payment_items: List[str] = []
-    other_amounts: List[str] = []
-
-    lower = text.lower()
-
-    if "amount due" in lower or "balance due" in lower:
-        payment_items.append("Amount due / Balance due")
-
-    if "due date" in lower or "pay by" in lower:
-        payment_items.append("Due date / Pay-by date")
-
-    # Extract dollar amounts
-    amounts = re.findall(r"\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})", text)
-    amounts = [a.strip() for a in amounts if a.strip()]
-    if amounts:
-        other_amounts.extend(amounts[:25])
-
-    return payment_items, other_amounts
